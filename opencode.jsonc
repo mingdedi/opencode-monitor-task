@@ -1,0 +1,5 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // 本地加载走项目级自动发现目录 .opencode/plugins/（scripts/install-local.sh 安装）。
+  // 不要用 "plugins": ["."] —— V2.0.x 会静默忽略本地路径条目（plugin list 中显示为空 ID）。
+}

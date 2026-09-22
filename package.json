@@ -1,0 +1,46 @@
+{
+  "name": "opencode-monitor-task",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin: Qwen Code-style monitor tool — run background commands whose stage output wakes the agent automatically.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "opencode-v2",
+    "monitor",
+    "background-task",
+    "agent-wakeup"
+  ],
+  "license": "MIT",
+  "author": "mingdedi",
+  "homepage": "https://github.com/mingdedi/opencode-monitor-task#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mingdedi/opencode-monitor-task.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mingdedi/opencode-monitor-task/issues"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

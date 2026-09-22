@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Logs
+*.log
+
+# Internal dev log — not published
+TODO.md
+
+# OS
+.DS_Store
+
+# OpenCode local dir (plugin install copy from scripts/install-local.sh,
+# plus any host-generated local files)
+.opencode/
+
+# Python (test/train-sim.py)
+__pycache__/
+*.pyc
