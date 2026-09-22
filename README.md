@@ -164,8 +164,8 @@ Monitored output flows into the model's context. **Do not monitor externally-wri
 
 The plugin writes diagnostics and panel state to fixed paths on the machine running OpenCode:
 
-- **Server log** — `$TMPDIR/opencode/opencode-monitor-task.log` (usually `/tmp/...`). Records the **full text of every monitored command**, session-context probes, and notification excerpts. Redirect with `OPENCODE_MONITOR_TASK_LOG_FILE` if you need it elsewhere.
-- **TUI log** — `$TMPDIR/opencode-monitor-tui.log`. TUI context probes and session-view diagnostics; same location class, no override variable.
+- **Server log** — `$TMPDIR/opencode/opencode-monitor-task.log` (usually `/tmp/...`). Records the **full text of every monitored command**, session-context probes (off unless `OPENCODE_MONITOR_TASK_DEBUG=1` is set), and notification excerpts. Redirect with `OPENCODE_MONITOR_TASK_LOG_FILE` if you need it elsewhere.
+- **TUI log** — `$TMPDIR/opencode-monitor-tui.log`. TUI context probes (same flag, off by default) and session-view diagnostics; same location class, no override variable.
 - **Panel state** — `${XDG_DATA_HOME:-~/.local/share}/opencode/monitor-task/`. Per-session `state_*.json` files carry the full command text, workspace path, and session id. They are transient: files for finished sessions are deleted after ~5 minutes, files without a heartbeat after ~10 minutes.
 
 On a single-user machine these are as private as anything else under `$TMPDIR` and `~/.local`. On **shared multi-user systems**, though, both locations are readable by other local accounts under default permissions — anything your monitored commands contain, including embedded credentials (tokens, passwords, URLs with keys), is exposed to every user on the host. Prefer: (a) keeping secrets out of monitored command lines, (b) pointing `OPENCODE_MONITOR_TASK_LOG_FILE` at a protected path under your home, and (c) a restrictive umask or ACLs on `~/.local`.

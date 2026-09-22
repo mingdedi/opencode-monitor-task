@@ -24,6 +24,9 @@ Initial public release.
 - File-based state bridge between the server and TUI plugin runtimes
   (`~/.local/share/opencode/monitor-task/`).
 - Unit test suite (108 tests) and scenario simulation scripts under `test/`.
+- Publish hygiene: `prepublishOnly` gate (typecheck + tests + pack dry-run),
+  `CHANGELOG.md` shipped in the npm package, and context-shape probes behind
+  `OPENCODE_MONITOR_TASK_DEBUG` (off by default).
 
 [Unreleased]: https://github.com/mingdedi/opencode-monitor-task/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/mingdedi/opencode-monitor-task/releases/tag/v0.1.0

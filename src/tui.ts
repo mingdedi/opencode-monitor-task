@@ -18,6 +18,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 const logFile = join(tmpdir(), "opencode-monitor-tui.log")
+// Same flag as the server-side log.ts: gates the context-shape probes.
+// Reads process.env directly — this entry keeps its imports node:-only.
+const DEBUG = process.env.OPENCODE_MONITOR_TASK_DEBUG === "1"
 const log = (s: string) => {
   try {
     appendFileSync(logFile, s + "\n")
@@ -48,56 +51,60 @@ export default {
       // undocumented; capture top-level keys plus one level of object keys
       // to find whether a "current session" source exists (source ① of the
       // session-scope panel) and what `location` actually carries.
-      try {
-        const c = context as Record<string, unknown>
-        const shape = Object.keys(c)
-          .map((k) => {
-            const v = c[k]
-            if (v !== null && typeof v === "object") {
-              try {
-                return `${k}:{${Object.keys(v as object).slice(0, 10).join("/")}}`
-              } catch {
-                return `${k}:{?}`
+      // Off by default — it writes workspace paths into the shared tmp log;
+      // set OPENCODE_MONITOR_TASK_DEBUG=1 to enable.
+      if (DEBUG) {
+        try {
+          const c = context as Record<string, unknown>
+          const shape = Object.keys(c)
+            .map((k) => {
+              const v = c[k]
+              if (v !== null && typeof v === "object") {
+                try {
+                  return `${k}:{${Object.keys(v as object).slice(0, 10).join("/")}}`
+                } catch {
+                  return `${k}:{?}`
+                }
               }
-            }
-            return `${k}:${typeof v}`
-          })
-          .join(" ")
-        log(`tui ctx shape: ${shape.slice(0, 1200)}`)
-        log(`tui location: ${JSON.stringify(c.location)?.slice(0, 300)}`)
-      } catch (err) {
-        log(`tui ctx probe failed: ${String(err).slice(0, 120)}`)
-      }
-      // M7 deep probe (one-shot): the `data` domain looked like the best
-      // candidate for "current session" (source ①). Capture the shape of its
-      // session/project/location entries and its on/listen subscribe pair —
-      // values only, no speculative calls (side-effect risk in the host).
-      try {
-        const c = context as Record<string, unknown>
-        const d = c.data as Record<string, unknown> | undefined
-        const desc = (v: unknown): string => {
-          if (typeof v === "function")
-            return `fn(arity ${String((v as (...a: unknown[]) => unknown).length)})`
-          if (v === null) return "null"
-          if (Array.isArray(v)) return `array[${v.length}]`
-          if (typeof v === "object")
-            try {
-              return `{${Object.keys(v as object).slice(0, 10).join("/")}}`
-            } catch {
-              return "{?}"
-            }
-          return `${typeof v}:${String(v).slice(0, 60)}`
+              return `${k}:${typeof v}`
+            })
+            .join(" ")
+          log(`tui ctx shape: ${shape.slice(0, 1200)}`)
+          log(`tui location: ${JSON.stringify(c.location)?.slice(0, 300)}`)
+        } catch (err) {
+          log(`tui ctx probe failed: ${String(err).slice(0, 120)}`)
         }
-        if (d) {
-          log(
-            `tui data.session: ${desc(d.session)} project: ${desc(d.project)} location: ${desc(d.location)}`,
-          )
-          log(`tui data.on: ${desc(d.on)} listen: ${desc(d.listen)}`)
-        } else {
-          log("tui data domain absent")
+        // M7 deep probe (one-shot): the `data` domain looked like the best
+        // candidate for "current session" (source ①). Capture the shape of its
+        // session/project/location entries and its on/listen subscribe pair —
+        // values only, no speculative calls (side-effect risk in the host).
+        try {
+          const c = context as Record<string, unknown>
+          const d = c.data as Record<string, unknown> | undefined
+          const desc = (v: unknown): string => {
+            if (typeof v === "function")
+              return `fn(arity ${String((v as (...a: unknown[]) => unknown).length)})`
+            if (v === null) return "null"
+            if (Array.isArray(v)) return `array[${v.length}]`
+            if (typeof v === "object")
+              try {
+                return `{${Object.keys(v as object).slice(0, 10).join("/")}}`
+              } catch {
+                return "{?}"
+              }
+            return `${typeof v}:${String(v).slice(0, 60)}`
+          }
+          if (d) {
+            log(
+              `tui data.session: ${desc(d.session)} project: ${desc(d.project)} location: ${desc(d.location)}`,
+            )
+            log(`tui data.on: ${desc(d.on)} listen: ${desc(d.listen)}`)
+          } else {
+            log("tui data domain absent")
+          }
+        } catch (err) {
+          log(`tui data probe failed: ${String(err).slice(0, 120)}`)
         }
-      } catch (err) {
-        log(`tui data probe failed: ${String(err).slice(0, 120)}`)
       }
       const { createPanel } = await import("./panel/view")
       const { createCurrentSessionGetter } = await import(

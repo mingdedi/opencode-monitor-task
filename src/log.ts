@@ -2,7 +2,8 @@ import { appendFileSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-const DEBUG = process.env.OPENCODE_MONITOR_TASK_DEBUG === "1"
+/** Debug flag: mirrors the server log to stderr AND enables context probes. */
+export const DEBUG = process.env.OPENCODE_MONITOR_TASK_DEBUG === "1"
 const LOG_FILE =
   process.env.OPENCODE_MONITOR_TASK_LOG_FILE ||
   join(tmpdir(), "opencode", "opencode-monitor-task.log")

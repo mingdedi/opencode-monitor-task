@@ -164,8 +164,8 @@ cd opencode-monitor-task
 
 插件会在运行 OpenCode 的机器上写入两个诊断日志和一组面板状态文件：
 
-- **服务端日志** — `$TMPDIR/opencode/opencode-monitor-task.log`（通常在 `/tmp` 下）：记录**每条被监控命令的全文**、会话上下文探测信息与通知片段。可用环境变量 `OPENCODE_MONITOR_TASK_LOG_FILE` 重定向。
-- **TUI 日志** — `$TMPDIR/opencode-monitor-tui.log`：TUI 上下文探测与会话视图诊断，位置同类，无重定向变量。
+- **服务端日志** — `$TMPDIR/opencode/opencode-monitor-task.log`（通常在 `/tmp` 下）：记录**每条被监控命令的全文**、会话上下文探测信息（默认关闭，需设 `OPENCODE_MONITOR_TASK_DEBUG=1` 开启）与通知片段。可用环境变量 `OPENCODE_MONITOR_TASK_LOG_FILE` 重定向。
+- **TUI 日志** — `$TMPDIR/opencode-monitor-tui.log`：TUI 上下文探测（同一开关，默认关闭）与会话视图诊断，位置同类，无重定向变量。
 - **面板状态** — `${XDG_DATA_HOME:-~/.local/share}/opencode/monitor-task/`：每会话一个 `state_*.json`，内含命令全文、工作区路径与 session id。文件是临时的：已结束会话的文件约 5 分钟后删除，失去心跳的文件约 10 分钟后回收。
 
 单用户机器上它们与 `$TMPDIR`、`~/.local` 下的其他文件一样私密。但在**多用户共享主机**上，这两个位置的默认权限对所有本地账号可读——被监控命令中的一切内容，包括内嵌的凭据（token、密码、带 key 的 URL），都会暴露给同机其他用户。建议：(a) 不要把密钥写进被监控命令行；(b) 用 `OPENCODE_MONITOR_TASK_LOG_FILE` 把服务端日志指向家目录下的受保护路径；(c) 对 `~/.local` 施加严格的 umask 或 ACL。
