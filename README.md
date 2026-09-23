@@ -5,6 +5,10 @@
 
 **[中文文档](./README.zh-CN.md)**
 
+## Platform support
+
+> ⚠️ **Windows: unvalidated — use with caution.** This plugin is developed and tested on Linux/macOS only. On Windows the core feature is broken: stdout of external programs is never captured (`lines_scanned` stays 0 in all wake modes; output written by `cmd.exe` built-ins does come through — likely a pipe-inheritance issue in the `cmd.exe` wrapper layer). A monitor therefore degrades to a "did it finish / did it crash" sentinel: no line-level wake-ups, and actively-printing tasks trigger false idle arbitrations. Process startup, lifecycle states, exit codes and idle arbitration themselves work. Treat Windows as unsupported until a fix lands.
+
 ## Why
 
 OpenCode's native background command notifies the agent **once, when the whole command finishes**. Mid-run milestones of long tasks (training epochs, build stages, log lines) never wake the agent, so the model either blocks doing nothing or burns tokens on polling.

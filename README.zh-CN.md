@@ -5,6 +5,10 @@
 
 **[English](./README.md)**
 
+## 平台支持
+
+> ⚠️ **Windows：未经验证，谨慎使用。** 本插件仅在 Linux/macOS 上开发与测试。Windows 上核心功能已知失效：外部程序的 stdout 完全捕获不到（所有唤醒模式下 `lines_scanned` 恒为 0；`cmd.exe` 内置命令的输出发送正常——疑似 cmd 包装层的管道继承问题）。monitor 因此退化为"跑完没 / 挂没挂"的哨兵：没有逐行唤醒，持续输出的任务还会触发误报的 idle 裁决。进程启动、生命周期状态、exit code 与 idle 裁决机制本身可用。修复落地前请视 Windows 为不支持。
+
 ## 为什么做这个
 
 OpenCode 原生的后台命令只在**整个命令结束**时通知 agent 一次。长时间任务（训练脚本、构建监控、日志观察）执行**中间**的阶段性标志（如 `epoch 3 done`、`stage 1 finish`）无法唤醒 agent，模型要么阻塞干等，要么靠轮询浪费 token。

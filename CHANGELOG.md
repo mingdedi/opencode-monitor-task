@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within a 500ms window merge into one notification by default — one batch
   counts as a single event against `max_events` and the token bucket.
   Explicit `coalesce_ms: 0` still opts out.
+- README (en/zh) now carries an explicit Windows warning: the plugin is
+  developed and tested on Linux/macOS only, and external-program stdout
+  capture is broken on Windows (`lines_scanned` stays 0 in all wake modes),
+  degrading monitors to run/exit sentinels with false idle arbitrations.
+  Windows is unvalidated — use with caution until a fix lands.
 
 ## [0.1.0] - 2026-09-22
 
