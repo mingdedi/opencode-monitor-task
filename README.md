@@ -106,7 +106,7 @@ A second plugin entry (`src/tui.ts`) renders a live monitor panel in the TUI sid
 
 - **Session scope**: the panel shows the current session's monitors only. The current session resolves through a source chain: the TUI context (when available) → the heartbeat file's `active_session_id` (the session that last ran any tool in this workspace) → nothing (collapsed). Switching sessions is picked up on the next 500ms poll.
 - **Two-level summaries**: `+N running in M other sessions` covers the rest of this workspace; `+N running across all workspaces` appears when other workspaces have active monitors. Terminal records from other sessions are not summarised.
-- **States**: `◐ starting` (spawn in flight) → `● running` → `✔ completed` / `✘ failed` / `■ stopped`; running rows show the live pid.
+- **States**: `◐ starting` (spawn in flight) → `● running` → `○ idle` (silent, arbitration pending) → `✔ completed` / `✘ failed` / `■ stopped`; live rows show the pid.
 - **Terminal record TTL**: each session keeps at most ONE newest terminal record (completed/failed/stopped); it disappears 5 minutes after the task finished.
 - **Plugin liveness**: every plugin instance heartbeats every 5s into its own `state_heartbeat_<pid>.json`; if no fresh heartbeat exists the panel shows `MONITORS · plugin offline` — distinguishing "no monitors" from "plugin not running".
 - **Coexistence**: the panel claims `sidebar.content` *additively* — other sidebar plugins (e.g. statusline) keep working; empty state collapses to nothing.
@@ -129,8 +129,8 @@ Then restart the TUI; `/tmp/opencode-monitor-tui.log` should show `claimed sideb
 |---|---|---|---|
 | `command` | string, required | — | Shell command to run and watch. Trailing `&` is stripped; a stray `&` elsewhere is rejected (`&&` allowed, and `&` inside fd redirections like `2>&1` or inside quotes is fine). `$(...)`, backticks, `<(...)`, `>(...)` are rejected. |
 | `description` | string ≤ 80 chars | — | Short note shown in every notification. |
-| `max_events` | int (0, 10000] | 1000 | Stop after this many notifications. Out-of-range values are rejected, not clamped. |
-| `idle_timeout_ms` | int (0, 600000] | 300000 | Stop when the command produces no output for this long. |
+| `max_events` | int (0, 10000] | 50 | Ceiling on output notifications before the monitor stops (and kills the command). An agent-tunable safety ceiling, not a fixed budget — estimate duration × wake rate for long/high-output tasks and pass an appropriate value; adjust later on a live monitor via `monitor_update`. Out-of-range values are rejected, not clamped. |
+| `idle_timeout_ms` | int (0, 600000] | 300000 | When the command is silent for this long, the monitor does **not** kill it: the agent gets an arbitration notice — `monitor_keepalive` resets the timer, `monitor_stop` kills now, and no decision within one more window (grace period) kills it then. Fresh output self-heals back to `running`. |
 | `directory` | absolute path | workspace root | Working directory; must resolve inside the project workspace. The default resolves from the plugin instance's workspace (`ctx.location`), which is correct even under a shared OpenCode service whose own cwd is `$HOME`. |
 | `pattern` | regex | — | Only matching lines wake the agent. Non-matching lines still count in `lines_scanned`. Invalid regex is rejected with the engine error. |
 | `wake_mode` | `all` \| `pattern` | implicit | `pattern` when `pattern` is given, else `all`. `all` + `pattern` counts matches but does not filter. |
@@ -141,7 +141,15 @@ Returns immediately with the monitor record (`mon_...` id, state, counters).
 
 ### `monitor_stop` — stop a monitor
 
-SIGTERM to the command's process group, escalating to SIGKILL. Takes `monitor_id`.
+SIGTERM to the command's process group, escalating to SIGKILL. Takes `monitor_id`. Works on `running` and `idle` monitors alike.
+
+### `monitor_keepalive` — reset the idle timer
+
+Answers "keep it" to a monitor-idle arbitration notice: revives an `idle` monitor back to `running` and resets the timer. On a `running` monitor it is a harmless explicit keepalive — useful when you know a silent phase (data loading, long validation) is coming. Terminal states are rejected.
+
+### `monitor_update` — adjust a live monitor
+
+Runtime parameter adjustment for a **live** monitor (`running`/`idle`; terminal monitors are rejected). Currently supports `max_events`: raise it when a long task is outgrowing the initial estimate (watch `events_sent` via `monitor_list` and adjust before the ceiling is hit — hitting it stops and kills the command), or lower it to stop early. A lowered ceiling already reached stops the monitor immediately.
 
 ### `monitor_list` — list all monitors
 
@@ -151,7 +159,8 @@ Running and finished (up to 200 retained), with state, counters (`events_sent` /
 
 - **Throttling** — token bucket: burst 5 notifications + 1/s sustained; over-limit lines are dropped (counted, never buffered).
 - **Lifecycle** — `starting` (spawn in flight, counted toward the concurrency cap) → `running` → terminal state; records expose the live `pid`.
-- **Auto-stop** — any of: `max_events` reached, `idle_timeout_ms` exceeded, command exit. On exit: code 0 → `completed`; non-zero → `failed: Exit code N`; signal → `failed: Killed by signal SIGxxx`.
+- **Idle arbitration** — an `idle_timeout_ms` expiry does not kill a merely-silent command: state flips to `idle`, the command keeps running, and a wake notice asks the agent to decide (`monitor_keepalive` vs `monitor_stop`). No decision within one more idle window (grace period) kills it; any fresh output self-heals back to `running`.
+- **Auto-stop** — any of: `max_events` reached, idle grace expired without a keepalive, command exit. On exit: code 0 → `completed`; non-zero → `failed: Exit code N`; signal → `failed: Killed by signal SIGxxx`.
 - **Output pipeline** — stdout+stderr merged, ANSI stripped, blank lines dropped, lines split on `\n`/`\r`/`\r\n` (progress-bar friendly), 64 KB no-newline soft wrap, 2000-char truncation per line.
 - **Concurrency** — max 16 running monitors per session.
 - **Cleanup** — process-group kill on stop; guards on host exit (`exit`/`SIGTERM`/`SIGINT`) leave zero orphans.
@@ -174,7 +183,7 @@ On a single-user machine these are as private as anything else under `$TMPDIR` a
 
 ```sh
 npm install
-npm test          # 108 unit tests, <2s
+npm test          # 116 unit tests, <2s
 npm run typecheck
 ./scripts/install-local.sh   # sync src/ into .opencode/plugins/ and hot-reload
 ```

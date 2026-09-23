@@ -164,20 +164,203 @@ test("monitor_stop kills the process group without orphans", async () => {
   }
 })
 
-test("idle timeout stops a silent command", async () => {
+test("idle timeout asks the agent first, then kills after the grace period", async () => {
   const h = makeHarness()
   try {
-    const started = Date.now()
     const r = await h.reg.start({
       command: "sleep 3004",
       idle_timeout_ms: 200,
       executeContext: EXEC_CTX,
     })
     assert.ok(r.ok)
+    // Phase 1 — arbitration: state flips to "idle", the command SURVIVES,
+    // and a notice with the keepalive instructions reaches the agent.
+    await waitFor(() => firstInfo(h).state === "idle")
+    assert.ok(pgrepExists("sleep 300[4]"), "command must survive the idle flip")
+    assert.ok(firstInfo(h).idle_deadline, "idle_deadline exposed while idle")
+    await waitFor(() =>
+      h.notifications.some(
+        (n) =>
+          n.text.includes("monitor idle:") &&
+          n.text.includes(`monitor_keepalive("${r.monitor.id}")`),
+      ),
+    )
+    // Phase 2 — no decision: grace expiry kills, exit_info says why.
     await waitFor(() => firstInfo(h).state === "stopped")
-    assert.match(firstInfo(h).exit_info ?? "", /idle timeout after 200ms/)
-    assert.ok(Date.now() - started < 5000, "should stop quickly")
+    assert.match(
+      firstInfo(h).exit_info ?? "",
+      /idle timeout after 200ms without output \(no keepalive/,
+    )
+    assert.equal(firstInfo(h).idle_deadline, null)
     await waitFor(() => !pgrepExists("sleep 300[4]"))
+    await waitFor(() =>
+      h.notifications.some((n) =>
+        n.text.includes("monitor stopped: idle timeout after 200ms"),
+      ),
+    )
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("monitor_keepalive revives an idle monitor and restarts the window", async () => {
+  const h = makeHarness()
+  try {
+    const r = await h.reg.start({
+      command: "sleep 3005",
+      idle_timeout_ms: 250,
+      executeContext: EXEC_CTX,
+    })
+    assert.ok(r.ok)
+    await waitFor(() => firstInfo(h).state === "idle")
+    const k = h.reg.keepalive(r.monitor.id)
+    assert.ok(k.ok, k.message)
+    assert.equal(firstInfo(h).state, "running")
+    assert.equal(firstInfo(h).idle_deadline, null)
+    // Without a SECOND keepalive the reset window elapses and the monitor
+    // goes idle AGAIN — proving the timer restarted (a still-running grace
+    // clock would have killed it at 2×250ms instead).
+    await waitFor(() => firstInfo(h).state === "idle")
+    assert.ok(pgrepExists("sleep 300[5]"), "still alive at the second idle flip")
+    await waitFor(() => firstInfo(h).state === "stopped")
+    await waitFor(() => !pgrepExists("sleep 300[5]"))
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("fresh output during the grace period self-heals to running", async () => {
+  const h = makeHarness()
+  try {
+    const r = await h.reg.start({
+      command: "sh -c 'sleep 1; echo back-from-silence'",
+      idle_timeout_ms: 700,
+      executeContext: EXEC_CTX,
+    })
+    assert.ok(r.ok)
+    await waitFor(() => firstInfo(h).state === "idle")
+    // The echo lands mid-grace: the monitor revives and the line still
+    // wakes the agent through the normal pipeline.
+    await waitFor(() => firstInfo(h).state === "running")
+    await waitFor(() =>
+      contentTexts(h).some((t) => t.includes("back-from-silence")),
+    )
+    await waitFor(() => firstInfo(h).state === "completed")
+    assert.equal(firstInfo(h).exit_info, "exit code 0")
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("monitor_stop kills an idle-grace monitor immediately", async () => {
+  const h = makeHarness()
+  try {
+    const r = await h.reg.start({
+      command: "sleep 3006",
+      idle_timeout_ms: 300,
+      executeContext: EXEC_CTX,
+    })
+    assert.ok(r.ok)
+    await waitFor(() => firstInfo(h).state === "idle")
+    const s = h.reg.stop(r.monitor.id)
+    assert.ok(s.ok, s.message)
+    await waitFor(() => firstInfo(h).state === "stopped")
+    assert.match(firstInfo(h).exit_info ?? "", /stopped by monitor_stop/)
+    await waitFor(() => !pgrepExists("sleep 300[6]"))
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("monitor_keepalive rejects unknown and terminal monitors", async () => {
+  const h = makeHarness()
+  try {
+    assert.ok(!h.reg.keepalive("mon_nope").ok)
+    const r = await h.reg.start({ command: "echo done", executeContext: EXEC_CTX })
+    assert.ok(r.ok)
+    await waitFor(() => firstInfo(h).state === "completed")
+    const k = h.reg.keepalive(r.monitor.id)
+    assert.ok(!k.ok)
+    assert.match(k.message, /already completed/)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("monitor_keepalive on a running monitor is a harmless timer reset", async () => {
+  const h = makeHarness()
+  try {
+    const r = await h.reg.start({
+      command: "sleep 3008",
+      idle_timeout_ms: 30000,
+      executeContext: EXEC_CTX,
+    })
+    assert.ok(r.ok)
+    const id = r.monitor.id
+    const stateOf = () => h.reg.list().find((m) => m.id === id)?.state
+    await waitFor(() => stateOf() === "running")
+    const k = h.reg.keepalive(id)
+    assert.ok(k.ok, k.message)
+    assert.match(k.message, /idle timer reset/)
+    assert.equal(stateOf(), "running")
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("monitor_update raising max_events keeps a live monitor under a low initial ceiling", async () => {
+  const h = makeHarness()
+  try {
+    const r = await h.reg.start({
+      command: "sh -c 'sleep 0.5; echo s1; sleep 1.5; echo s2'",
+      max_events: 1,
+      executeContext: EXEC_CTX,
+    })
+    assert.ok(r.ok)
+    // Raise the ceiling BEFORE the first line arrives; without this the
+    // monitor (and command) would die on s1.
+    const u = h.reg.update(r.monitor.id, 10)
+    assert.ok(u.ok, u.message)
+    assert.match(u.message, /max_events set to 10/)
+    await waitFor(() => firstInfo(h).state === "completed")
+    const info = firstInfo(h)
+    assert.equal(info.exit_info, "exit code 0")
+    assert.equal(info.events_sent, 2, "both lines delivered under the raised ceiling")
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("monitor_update lowering max_events to a reached ceiling stops immediately", async () => {
+  const h = makeHarness()
+  try {
+    const r = await h.reg.start({
+      command: "sh -c 'echo k1; sleep 30'",
+      max_events: 10,
+      executeContext: EXEC_CTX,
+    })
+    assert.ok(r.ok)
+    await waitFor(() => firstInfo(h).events_sent >= 1)
+    const u = h.reg.update(r.monitor.id, 1)
+    assert.ok(u.ok, u.message)
+    await waitFor(() => firstInfo(h).state === "stopped")
+    assert.match(firstInfo(h).exit_info ?? "", /lowered by monitor_update/)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("monitor_update rejects unknown ids, terminal monitors, and bad values", async () => {
+  const h = makeHarness()
+  try {
+    assert.ok(!h.reg.update("mon_nope", 10).ok)
+    assert.ok(!h.reg.update("mon_nope", null).ok)
+    const r = await h.reg.start({ command: "echo done", executeContext: EXEC_CTX })
+    assert.ok(r.ok)
+    await waitFor(() => firstInfo(h).state === "completed")
+    const k = h.reg.update(r.monitor.id, 10)
+    assert.ok(!k.ok)
+    assert.match(k.message, /already completed/)
   } finally {
     h.cleanup()
   }

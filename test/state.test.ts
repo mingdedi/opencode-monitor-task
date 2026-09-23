@@ -84,6 +84,7 @@ function monitor(over: Partial<PublicInfo> = {}): PublicInfo {
     started_at: new Date().toISOString(),
     stopped_at: null,
     exit_info: null,
+    idle_deadline: null,
     ...over,
   }
 }

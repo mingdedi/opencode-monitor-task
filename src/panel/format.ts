@@ -19,6 +19,7 @@ export interface Line {
 const ICONS: Record<PublicInfo["state"], string> = {
   starting: "◐",
   running: "●",
+  idle: "○",
   completed: "✔",
   failed: "✘",
   stopped: "■",
@@ -56,7 +57,9 @@ function elapsedOf(m: PublicInfo, now: number): number {
 }
 
 function monitorLines(m: PublicInfo, now: number): Line[] {
-  const isLive = m.state === "running" || m.state === "starting"
+  // "idle" is alive (arbitration pause) — show elapsed time and pid.
+  const isLive =
+    m.state === "running" || m.state === "starting" || m.state === "idle"
   const head = isLive
     ? `${stateIcon(m.state)} ${shortId(m.id)} ${fmtDuration(elapsedOf(m, now))}`
     : `${stateIcon(m.state)} ${shortId(m.id)} ${truncate(m.exit_info ?? m.state, PANEL_WIDTH - 4 - shortId(m.id).length)}`
@@ -79,7 +82,7 @@ export function renderLines(state: PanelState, now = Date.now()): Line[] {
   const lines: Line[] = []
   if (state.monitors.length > 0) {
     const live = state.monitors.filter(
-      (m) => m.state === "running" || m.state === "starting",
+      (m) => m.state === "running" || m.state === "starting" || m.state === "idle",
     )
     const finished = state.monitors.length - live.length
     const headParts = ["MONITORS", `${live.length} running`]

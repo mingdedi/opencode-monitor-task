@@ -73,7 +73,8 @@ interface SessionFileRecord {
 }
 
 function isLive(m: PublicInfo): boolean {
-  return m.state === "running" || m.state === "starting"
+  // "idle" is an arbitration pause on a live command, not a terminal state.
+  return m.state === "running" || m.state === "starting" || m.state === "idle"
 }
 
 export function readPanelState(dir: string, opts: ReadOptions = {}): PanelState {

@@ -63,7 +63,7 @@ test("allows fd redirection and quoted ampersands (not backgrounding)", () => {
 
 test("parameter defaults", () => {
   const r = validateParams({})
-  assert.equal(r.maxEvents, 1000)
+  assert.equal(r.maxEvents, 50)
   assert.equal(r.idleTimeoutMs, 300_000)
 })
 

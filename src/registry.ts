@@ -36,7 +36,10 @@ const COALESCE_SHOWN_WIDTH = 200
 // Hard cap on pending coalesced lines so a firehose cannot grow memory.
 const MAX_PENDING_LINES = 1000
 
-type MonitorState = "starting" | "running" | "completed" | "failed" | "stopped"
+// "idle" = idle_timeout_ms elapsed without output; the command is STILL
+// ALIVE and the agent is asked to decide (keepalive vs kill) within one
+// more idle window before the grace timer kills the process group.
+type MonitorState = "starting" | "running" | "idle" | "completed" | "failed" | "stopped"
 
 interface MonitorEntry {
   id: string
@@ -69,6 +72,10 @@ interface MonitorEntry {
   outBuffer: string
   errBuffer: string
   idleTimer: ReturnType<typeof setTimeout> | null
+  /** Grace timer armed when entering "idle"; expiry without a keepalive kills. */
+  graceTimer: ReturnType<typeof setTimeout> | null
+  /** Epoch ms after which an idle monitor is killed (publicInfo → idle_deadline). */
+  idleDeadline: number | null
   killTimer: ReturnType<typeof setTimeout> | null
   finalized: boolean
 }
@@ -95,6 +102,8 @@ export interface PublicInfo {
   started_at: string
   stopped_at: string | null
   exit_info: string | null
+  /** Set while state === "idle": when the grace window kills the command. */
+  idle_deadline: string | null
 }
 
 export type StartResult =
@@ -115,6 +124,19 @@ export interface Registry {
     executeContext: unknown
   }): Promise<StartResult>
   stop(id: string): { ok: boolean; message: string }
+  /**
+   * Reset the idle timer (agent answered "keep it" to an idle notice).
+   * On an "idle" monitor this revives it to "running"; on a "running"
+   * monitor it is a harmless explicit keepalive. Terminal states error.
+   */
+  keepalive(id: string): { ok: boolean; message: string }
+  /**
+   * Runtime parameter adjustment for a LIVE monitor (running/idle).
+   * Raising max_events lets a long noisy task keep its monitor after the
+   * initial estimate proved too low; lowering it to <= eventsSent stops the
+   * monitor immediately (same ceiling rule as dispatch).
+   */
+  update(id: string, maxEvents: number | null): { ok: boolean; message: string }
   list(): PublicInfo[]
   stopAll(reason: string): void
   /** Stop everything and detach from process guards (plugin unload). */
@@ -237,6 +259,7 @@ export function createRegistry(
       started_at: new Date(e.startedAt).toISOString(),
       stopped_at: e.stoppedAt ? new Date(e.stoppedAt).toISOString() : null,
       exit_info: e.exitInfo,
+      idle_deadline: e.idleDeadline ? new Date(e.idleDeadline).toISOString() : null,
     }
   }
 
@@ -305,14 +328,62 @@ export function createRegistry(
     }
   }
 
+  function clearGrace(e: MonitorEntry) {
+    if (e.graceTimer) {
+      clearTimeout(e.graceTimer)
+      e.graceTimer = null
+    }
+    e.idleDeadline = null
+  }
+
   function armIdle(e: MonitorEntry) {
     clearIdle(e)
-    e.idleTimer = setTimeout(() => {
-      if (e.state === "running") {
-        log(`${e.id}: idle timeout after ${e.idleTimeoutMs}ms`)
-        finalize(e, "stopped", `idle timeout after ${e.idleTimeoutMs}ms without output`)
+    e.idleTimer = setTimeout(() => enterIdleGrace(e), e.idleTimeoutMs)
+  }
+
+  /**
+   * Idle timeout fired. Instead of killing a merely-silent command, ask the
+   * agent: keepalive resets the timer, monitor_stop kills now, and doing
+   * nothing for one more idle window (the grace period) kills then. The
+   * command keeps running throughout — its state stays queryable via
+   * monitor_list ("idle"), and any new output self-heals back to "running".
+   */
+  function enterIdleGrace(e: MonitorEntry) {
+    if (e.state !== "running" || e.finalized) return
+    // Flush any pending coalesce batch first, while the state is still
+    // "running" — the arbitration notice must not swallow the batch tail.
+    flushCoalesce(e)
+    e.state = "idle"
+    e.idleDeadline = Date.now() + e.idleTimeoutMs
+    notifyChange()
+    log(`${e.id}: idle ${e.idleTimeoutMs}ms without output — arbitration notice sent (grace ${e.idleTimeoutMs}ms)`)
+    const ms = e.idleTimeoutMs
+    const text = [
+      `monitor idle: no output for ${ms}ms — command still running (pid ${e.pid}).`,
+      `Keep it: call monitor_keepalive("${e.id}") to reset the idle timer.`,
+      `Kill it now: monitor_stop("${e.id}").`,
+      `No decision within ${ms}ms (grace period): it will be killed automatically.`,
+    ].join("\n")
+    // Same channel/rules as lifecycle notices: queue mode, no max_events cost.
+    e.deliverChain = e.deliverChain.then(() => deliver(e, text, "queue"))
+    e.graceTimer = setTimeout(() => {
+      if (e.state === "idle") {
+        finalize(
+          e,
+          "stopped",
+          `idle timeout after ${ms}ms without output (no keepalive within ${ms}ms grace period)`,
+        )
       }
-    }, e.idleTimeoutMs)
+    }, ms)
+  }
+
+  /** Leave "idle" back to "running": agent keepalive or fresh command output. */
+  function resumeRunning(e: MonitorEntry, reason: string) {
+    if (e.state !== "idle") return
+    clearGrace(e)
+    e.state = "running"
+    notifyChange()
+    log(`${e.id}: resumed running (${reason})`)
   }
 
   /**
@@ -366,6 +437,7 @@ export function createRegistry(
     e.exitInfo = exitInfo
     notifyChange()
     clearIdle(e)
+    clearGrace(e)
     if (state === "stopped" || state === "failed") killGroup(e)
     log(`${e.id}: finalized state=${state} exit="${exitInfo}"`)
     // A coalescing batch that has not hit its window yet still belongs to the
@@ -450,7 +522,7 @@ export function createRegistry(
     let pruned = false
     for (const [id, e] of monitors) {
       if (monitors.size <= maxRetained) break
-      if (e.state === "running" || e.state === "starting") continue
+      if (e.state !== "completed" && e.state !== "failed" && e.state !== "stopped") continue
       e.child = null // release process/stream references
       monitors.delete(id)
       pruned = true
@@ -487,6 +559,12 @@ export function createRegistry(
     if (!stream) return
     stream.setEncoding("utf8")
     stream.on("data", (chunk: string) => {
+      if (e.state === "idle") {
+        // The command broke its silence during the grace window — the
+        // arbitration question answered itself. Revive first so this chunk
+        // flows through the normal pipeline (it can still wake the agent).
+        resumeRunning(e, "new output during idle grace")
+      }
       if (e.state !== "running") return
       armIdle(e) // any output resets the idle timer, even throttled lines
       const buffer = (e[key] += chunk)
@@ -515,7 +593,7 @@ export function createRegistry(
 
   const killRunningImmediate = () => {
     for (const e of monitors.values()) {
-      if (e.state === "running") killGroup(e, true)
+      if (e.state === "running" || e.state === "idle") killGroup(e, true)
     }
   }
 
@@ -565,7 +643,7 @@ export function createRegistry(
 
     const runningForSession = [...monitors.values()].filter(
       (e) =>
-        (e.state === "running" || e.state === "starting") &&
+        (e.state === "running" || e.state === "starting" || e.state === "idle") &&
         e.sessionID === sessionID,
     )
     if (runningForSession.length >= maxConcurrent) {
@@ -611,6 +689,8 @@ export function createRegistry(
       outBuffer: "",
       errBuffer: "",
       idleTimer: null,
+      graceTimer: null,
+      idleDeadline: null,
       killTimer: null,
       finalized: false,
     }
@@ -689,7 +769,7 @@ export function createRegistry(
     if (!e) {
       return { ok: false, message: `unknown monitor id: ${id}` }
     }
-    if (e.state !== "running") {
+    if (e.state !== "running" && e.state !== "idle") {
       return { ok: true, message: `monitor ${id} already ${e.state}: ${e.exitInfo}` }
     }
     finalize(e, "stopped", "stopped by monitor_stop")
@@ -699,13 +779,65 @@ export function createRegistry(
     }
   }
 
+  function keepalive(id: string): { ok: boolean; message: string } {
+    const e = monitors.get(id)
+    if (!e) {
+      return { ok: false, message: `unknown monitor id: ${id}` }
+    }
+    if (e.state === "idle") {
+      resumeRunning(e, "monitor_keepalive")
+      armIdle(e)
+      return {
+        ok: true,
+        message: `monitor ${id} resumed from idle-grace; idle timer reset to ${e.idleTimeoutMs}ms`,
+      }
+    }
+    if (e.state === "running") {
+      armIdle(e)
+      return {
+        ok: true,
+        message: `monitor ${id} idle timer reset to ${e.idleTimeoutMs}ms (was running)`,
+      }
+    }
+    return { ok: false, message: `monitor ${id} already ${e.state}: ${e.exitInfo}` }
+  }
+
+  function update(id: string, maxEvents: number | null): { ok: boolean; message: string } {
+    if (maxEvents === null) {
+      return { ok: false, message: "nothing to update: pass max_events" }
+    }
+    const e = monitors.get(id)
+    if (!e) {
+      return { ok: false, message: `unknown monitor id: ${id}` }
+    }
+    if (e.state !== "running" && e.state !== "idle") {
+      return { ok: false, message: `monitor ${id} already ${e.state}: ${e.exitInfo}` }
+    }
+    const v = validateParams({ max_events: maxEvents })
+    if (v.error) {
+      return { ok: false, message: v.error }
+    }
+    e.maxEvents = v.maxEvents
+    // Same ceiling semantics as dispatchLine: a lowered ceiling already
+    // reached stops the monitor right away.
+    if (e.eventsSent >= e.maxEvents) {
+      finalize(e, "stopped", `reached max_events=${e.maxEvents} (lowered by monitor_update)`)
+      return { ok: true, message: `monitor ${id} max_events set to ${e.maxEvents}; ceiling already reached — stopped` }
+    }
+    notifyChange()
+    return {
+      ok: true,
+      message: `monitor ${id} max_events set to ${e.maxEvents} (sent ${e.eventsSent} so far)`,
+    }
+  }
+
   function list(): PublicInfo[] {
     return [...monitors.values()].map(publicInfo)
   }
 
   function stopAll(reason: string): void {
     for (const e of monitors.values()) {
-      if (e.state === "running") {
+      if (e.state === "running" || e.state === "idle") {
         finalize(e, "stopped", reason)
       }
     }
@@ -721,5 +853,5 @@ export function createRegistry(
     liveKillers.delete(killRunningImmediate)
   }
 
-  return { start, stop, list, stopAll, dispose }
+  return { start, stop, keepalive, update, list, stopAll, dispose }
 }

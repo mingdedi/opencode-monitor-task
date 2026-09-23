@@ -106,7 +106,7 @@ cd opencode-monitor-task
 
 - **session 级视野**：面板只显示当前 session 的监控明细。当前 session 经来源链解析：TUI 上下文（可用时）→ 心跳文件的 `active_session_id`（本工作区内最近执行过任意工具的 session）→ 无（折叠）。切换 session 后下一次 500ms 轮询自动跟随。
 - **两级摘要**：`+N running in M other sessions` 汇总本工作区其余 session；其他工作区有活跃任务时追加 `+N running across all workspaces`。其他 session 的终态不做摘要。
-- **状态**：`◐ starting`（进程拉起中）→ `● running` → `✔ completed` / `✘ failed` / `■ stopped`；运行中的行显示实时 pid
+- **状态**：`◐ starting`（进程拉起中）→ `● running` → `○ idle`（静默、等待裁决）→ `✔ completed` / `✘ failed` / `■ stopped`；存活行显示实时 pid
 - **终态 TTL**：每个 session 最多保留最近 1 条终态记录（completed/failed/stopped 任一）；任务结束 5 分钟后自动消失
 - **插件存活**：每个插件实例每 5s 向自己的 `state_heartbeat_<pid>.json` 写心跳；无新鲜心跳时面板显示 `MONITORS · plugin offline`——区分"没有监控"与"插件没在跑"
 - **共存**：面板以叠加方式认领 `sidebar.content` 槽位——其他侧边栏插件（如 statusline）不受影响；无监控时空态折叠不占行
@@ -129,8 +129,8 @@ cd opencode-monitor-task
 |---|---|---|---|
 | `command` | string，必填 | — | 要执行的 shell 命令。尾部 `&` 自动移除；非末尾孤立 `&` 拒绝（`&&` 允许；fd 重定向如 `2>&1` 及引号内的 `&` 不受影响）。`$(...)`、反引号、`<(...)`、`>(...)` 直接拒绝。 |
 | `description` | string ≤ 80 字符 | — | 展示在每条通知里的简短说明。 |
-| `max_events` | int (0, 10000] | 1000 | 通知数达到上限即停止。越界值拒绝而非截断。 |
-| `idle_timeout_ms` | int (0, 600000] | 300000 | 命令无输出超过该时长即停止。 |
+| `max_events` | int (0, 10000] | 50 | 通知数上限，达到即停止（并杀掉命令）。这是 agent 可调的安全上限而非固定预算——长任务/高输出任务请按"时长 × 唤醒频率"自行估算并传合适值；运行中还可用 `monitor_update` 调整。越界值拒绝而非截断。 |
+| `idle_timeout_ms` | int (0, 600000] | 300000 | 命令静默超过该时长**不会**被直接杀掉：agent 收到裁决通知——`monitor_keepalive` 重置计时器，`monitor_stop` 立即杀，一个窗口的宽限期内不做决定才自动杀。期间命令恢复输出则自愈回 `running`。 |
 | `directory` | 绝对路径 | 工作区根 | 命令工作目录；必须解析到项目工作区内。默认值从插件实例的工作区（`ctx.location`）解析——即使在共享 OpenCode 服务（其自身 cwd 为 `$HOME`）下也正确。 |
 | `pattern` | 正则 | — | 仅命中行唤醒；未命中行计入 `lines_scanned`。非法正则带引擎错误拒绝。 |
 | `wake_mode` | `all` \| `pattern` | 隐式 | 有 `pattern` 时为 `pattern`，否则 `all`。`all`+pattern 只统计不过滤。 |
@@ -141,7 +141,15 @@ cd opencode-monitor-task
 
 ### `monitor_stop` — 停止监控
 
-向命令进程组发 SIGTERM，逐步升级到 SIGKILL。参数为 `monitor_id`。
+向命令进程组发 SIGTERM，逐步升级到 SIGKILL。参数为 `monitor_id`。对 `running` 和 `idle` 状态均有效。
+
+### `monitor_keepalive` — 重置空闲计时器
+
+对 idle 裁决通知回答"保留"：把 `idle` 状态的监控复活回 `running` 并重置计时器。对 `running` 状态的监控则是无害的主动续命——预知任务将进入静默期（数据加载、长验证）时有用。终态拒绝。
+
+### `monitor_update` — 运行时调整
+
+对**存活**的监控（`running`/`idle`，终态拒绝）做运行时参数调整。当前支持 `max_events`：长任务超出初始估算时调大（用 `monitor_list` 观察 `events_sent`，在触顶前调整——触顶即停止并杀命令）；也可调小以提前停止。调小到已发送数以下立即停止。
 
 ### `monitor_list` — 查看全部监控
 
@@ -151,7 +159,8 @@ cd opencode-monitor-task
 
 - **节流** — 令牌桶：突发 5 条 + 每秒 1 条；超限行丢弃（计数，不缓存）
 - **生命周期** — `starting`（进程拉起中，计入并发上限）→ `running` → 终态；记录携带实时 `pid`
-- **自动停止** — 三条件任一：`max_events` 达标 / `idle_timeout_ms` 超时 / 命令退出。退出映射：exit 0 → `completed`；非零 → `failed: Exit code N`；信号 → `failed: Killed by signal SIGxxx`
+- **空闲裁决** — `idle_timeout_ms` 到期不直接杀静默命令：状态转为 `idle`、命令继续运行、唤醒通知请 agent 裁决（`monitor_keepalive` 保留 / `monitor_stop` 立即杀）。一个完整窗口的宽限期内无决定才自动杀；期间命令恢复输出则自愈回 `running`
+- **自动停止** — 三条件任一：`max_events` 达标 / 宽限期到仍无 keepalive / 命令退出。退出映射：exit 0 → `completed`；非零 → `failed: Exit code N`；信号 → `failed: Killed by signal SIGxxx`
 - **输出处理** — stdout+stderr 合流、去 ANSI、去空行、按 `\n`/`\r`/`\r\n` 分行（兼容进度条输出）、64KB 无换行软换行、单行截断 2000 字符
 - **并发** — 每会话最多 16 个运行中的监控
 - **清理** — 停止时进程组级击杀；宿主退出（`exit`/`SIGTERM`/`SIGINT`）守卫，零孤儿
@@ -174,7 +183,7 @@ cd opencode-monitor-task
 
 ```sh
 npm install
-npm test          # 108 个单元测试，<2s
+npm test          # 116 个单元测试，<2s
 npm run typecheck
 ./scripts/install-local.sh   # 同步 src/ 到 .opencode/plugins/ 并触发热重载
 ```

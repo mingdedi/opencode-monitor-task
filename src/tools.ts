@@ -18,7 +18,7 @@ export function createTools(registry: Registry): ToolDefinition[] {
       "STRONGLY RECOMMENDED: pass `pattern` (a regex) so only meaningful lines wake you — noisy lines are counted in lines_scanned but discarded, saving context tokens and shrinking the prompt-injection surface (e.g. pattern=\"epoch.*done|ERROR|FAILED\").",
       "The command must be non-interactive (stdin is closed) and must not append '&' — backgrounding is managed for you.",
       "Output is rate-limited (burst 5, then 1/s; excess lines are dropped, counted in monitor_list). `coalesce_ms` merges bursts of wake lines into one notification.",
-      "Stops automatically when the command exits, when max_events is reached, or after idle_timeout_ms without output; the exit status is sent as a final notification.",
+      "Stops automatically when the command exits or when max_events is reached; an idle_timeout_ms expiry asks the agent first (keepalive vs kill) instead of killing a silent command outright. The exit status is sent as a final notification.",
       "Returns immediately with a monitor id. Stop early with monitor_stop; inspect states with monitor_list.",
     ].join(" "),
     input: {
@@ -34,11 +34,11 @@ export function createTools(registry: Registry): ToolDefinition[] {
         },
         max_events: {
           type: "integer",
-          description: `Stop after this many output notifications. Integer in (0, ${MAX_EVENTS_LIMIT}]. Default ${MAX_EVENTS_DEFAULT}. Out-of-range values are rejected.`,
+          description: `Ceiling on output notifications before the monitor stops (and kills the command). Default ${MAX_EVENTS_DEFAULT} — an agent-tunable safety ceiling, NOT a fixed budget: for a long-running or high-output task, estimate the wake count (duration × wake rate) and pass an appropriate value yourself; you can also adjust it later on a live monitor via monitor_update. Integer in (0, ${MAX_EVENTS_LIMIT}]. Out-of-range values are rejected.`,
         },
         idle_timeout_ms: {
           type: "integer",
-          description: `Stop when the command produces no output for this long. Integer in (0, ${IDLE_TIMEOUT_LIMIT}]. Default ${IDLE_TIMEOUT_DEFAULT} (5 min).`,
+          description: `When the command is silent for this long, the monitor does NOT kill it right away: the agent is asked via a wake notification — call monitor_keepalive to reset the timer, or monitor_stop to kill; no decision within one more window (grace period) kills it. Fresh output self-heals back to running. Integer in (0, ${IDLE_TIMEOUT_LIMIT}]. Default ${IDLE_TIMEOUT_DEFAULT} (5 min).`,
         },
         directory: {
           type: "string",
@@ -113,6 +113,59 @@ export function createTools(registry: Registry): ToolDefinition[] {
     },
   }
 
+  const monitorKeepalive: ToolDefinition = {
+    name: "monitor_keepalive",
+    description:
+      'Reset a monitor\'s idle timer. Primary use: answer "keep it" to a monitor-idle arbitration notice (revives the monitor from the idle-grace state back to running). Calling it on a running monitor is a harmless explicit keepalive — useful when you know a silent phase (data loading, long validation) is coming. Terminal states are rejected.',
+    input: {
+      type: "object",
+      properties: {
+        monitor_id: {
+          type: "string",
+          description: "Monitor id returned by the monitor tool (mon_...).",
+        },
+      },
+      required: ["monitor_id"],
+      additionalProperties: false,
+    },
+    execute: async (input) => {
+      const id = (input as { monitor_id?: unknown })?.monitor_id
+      const r = registry.keepalive(typeof id === "string" ? id : "")
+      return { content: `monitor_keepalive: ${r.message}` }
+    },
+  }
+
+  const monitorUpdate: ToolDefinition = {
+    name: "monitor_update",
+    description:
+      "Adjust a LIVE monitor's parameters at runtime (it must be running or idle-grace; terminal monitors are rejected). Currently supports max_events: raise it when a long task is outgrowing your initial estimate (watch events_sent via monitor_list and adjust before the ceiling is hit — hitting it stops and kills the command), or lower it to stop early. A lowered ceiling already reached stops the monitor immediately.",
+    input: {
+      type: "object",
+      properties: {
+        monitor_id: {
+          type: "string",
+          description: "Monitor id returned by the monitor tool (mon_...).",
+        },
+        max_events: {
+          type: "integer",
+          description: `New notification ceiling. Integer in (0, ${MAX_EVENTS_LIMIT}].`,
+        },
+      },
+      required: ["monitor_id", "max_events"],
+      additionalProperties: false,
+    },
+    execute: async (input) => {
+      const i = input as { monitor_id?: unknown; max_events?: unknown }
+      const id = typeof i.monitor_id === "string" ? i.monitor_id : ""
+      const maxEvents =
+        typeof i.max_events === "number" && Number.isInteger(i.max_events)
+          ? i.max_events
+          : null
+      const r = registry.update(id, maxEvents)
+      return { content: `monitor_update: ${r.message}` }
+    },
+  }
+
   const monitorList: ToolDefinition = {
     name: "monitor_list",
     description:
@@ -125,5 +178,5 @@ export function createTools(registry: Registry): ToolDefinition[] {
     execute: async () => ({ content: JSON.stringify(registry.list(), null, 2) }),
   }
 
-  return [monitor, monitorStop, monitorList]
+  return [monitor, monitorStop, monitorKeepalive, monitorUpdate, monitorList]
 }

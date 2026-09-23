@@ -209,11 +209,16 @@ export function groupSessions(
     bySession.set(sid, list)
   }
   for (const [sid, list] of bySession) {
+    // "idle" is an arbitration pause, not a terminal state — the command is
+    // still alive, so it must stay active in the panel projection.
     const active = list.filter(
-      (m) => m.state === "running" || m.state === "starting",
+      (m) => m.state === "running" || m.state === "starting" || m.state === "idle",
     )
     const finished = list
-      .filter((m) => m.state !== "running" && m.state !== "starting")
+      .filter(
+        (m) =>
+          m.state !== "running" && m.state !== "starting" && m.state !== "idle",
+      )
       .sort((a, b) =>
         (b.stopped_at ?? "").localeCompare(a.stopped_at ?? ""),
       )
@@ -254,7 +259,8 @@ export function createStateWriter(options: StateWriterOptions): StateWriter {
       for (const [sid, monitors] of groups) {
         const path = sessionStatePath(options.dir, sid)
         const hasActive = monitors.some(
-          (m) => m.state === "running" || m.state === "starting",
+          (m) =>
+            m.state === "running" || m.state === "starting" || m.state === "idle",
         )
         if (!hasActive) {
           // Finished-only session: show the terminal record for lingerMs

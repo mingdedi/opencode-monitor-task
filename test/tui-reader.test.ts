@@ -60,6 +60,7 @@ function m(state: PublicInfo["state"], id = "mon_x1"): PublicInfo {
     started_at: "2026-09-22T10:00:00Z",
     stopped_at: state === "running" || state === "starting" ? null : "2026-09-22T10:00:05Z",
     exit_info: state === "running" || state === "starting" ? null : "exit code 0",
+    idle_deadline: state === "idle" ? "2026-09-22T10:00:10Z" : null,
   }
 }
 

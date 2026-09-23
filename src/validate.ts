@@ -3,7 +3,7 @@
 import { realpathSync, statSync } from "node:fs"
 import { isAbsolute, sep } from "node:path"
 
-export const MAX_EVENTS_DEFAULT = 1000
+export const MAX_EVENTS_DEFAULT = 50
 export const MAX_EVENTS_LIMIT = 10_000
 export const IDLE_TIMEOUT_DEFAULT = 300_000
 export const IDLE_TIMEOUT_LIMIT = 600_000
