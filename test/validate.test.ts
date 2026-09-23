@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  COALESCE_DEFAULT,
   validateCoalesce,
   validateCommand,
   validateDelivery,
@@ -151,8 +152,9 @@ test("validateDelivery and validateCoalesce bounds", () => {
   assert.equal(validateDelivery(undefined).delivery, "queue")
   assert.equal(validateDelivery("steer").delivery, "steer")
   assert.ok(validateDelivery("now").error)
-  assert.equal(validateCoalesce(undefined).coalesceMs, 0)
-  assert.equal(validateCoalesce(0).coalesceMs, 0)
+  assert.equal(validateCoalesce(undefined).coalesceMs, COALESCE_DEFAULT)
+  assert.equal(COALESCE_DEFAULT, 500, "coalescing is on by default (500ms window)")
+  assert.equal(validateCoalesce(0).coalesceMs, 0, "explicit 0 still opts out")
   assert.equal(validateCoalesce(60_000).coalesceMs, 60_000)
   assert.ok(validateCoalesce(60_001).error)
   assert.ok(validateCoalesce(-1).error)

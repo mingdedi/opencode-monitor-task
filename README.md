@@ -135,7 +135,7 @@ Then restart the TUI; `/tmp/opencode-monitor-tui.log` should show `claimed sideb
 | `pattern` | regex | — | Only matching lines wake the agent. Non-matching lines still count in `lines_scanned`. Invalid regex is rejected with the engine error. |
 | `wake_mode` | `all` \| `pattern` | implicit | `pattern` when `pattern` is given, else `all`. `all` + `pattern` counts matches but does not filter. |
 | `delivery` | `queue` \| `steer` | `queue` | What to do when the session is busy. Lifecycle notices are always queued. |
-| `coalesce_ms` | int [0, 60000] | 0 (off) | Merge wake lines arriving within this window into one notification (first 10 lines, 200 chars each). |
+| `coalesce_ms` | int [0, 60000] | 500 | Merge wake lines arriving within this window into one notification (first 10 lines, 200 chars each; one batch = one event against `max_events`). On by default — bursts of high-frequency output cost one notification per batch. 0 disables. |
 
 Returns immediately with the monitor record (`mon_...` id, state, counters).
 
@@ -157,6 +157,7 @@ Running and finished (up to 200 retained), with state, counters (`events_sent` /
 
 ## Behavior & guarantees
 
+- **Coalescing** — wake lines arriving within a 500ms window (default `coalesce_ms`) merge into ONE notification: first 10 lines at 200 chars each, the rest suppressed with a count. One batch counts as a single event against `max_events` and the token bucket. `coalesce_ms: 0` opts out.
 - **Throttling** — token bucket: burst 5 notifications + 1/s sustained; over-limit lines are dropped (counted, never buffered).
 - **Lifecycle** — `starting` (spawn in flight, counted toward the concurrency cap) → `running` → terminal state; records expose the live `pid`.
 - **Idle arbitration** — an `idle_timeout_ms` expiry does not kill a merely-silent command: state flips to `idle`, the command keeps running, and a wake notice asks the agent to decide (`monitor_keepalive` vs `monitor_stop`). No decision within one more idle window (grace period) kills it; any fresh output self-heals back to `running`.

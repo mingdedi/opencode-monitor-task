@@ -135,7 +135,7 @@ cd opencode-monitor-task
 | `pattern` | 正则 | — | 仅命中行唤醒；未命中行计入 `lines_scanned`。非法正则带引擎错误拒绝。 |
 | `wake_mode` | `all` \| `pattern` | 隐式 | 有 `pattern` 时为 `pattern`，否则 `all`。`all`+pattern 只统计不过滤。 |
 | `delivery` | `queue` \| `steer` | `queue` | 会话正忙时的投递方式。生命周期通知恒为 `queue`。 |
-| `coalesce_ms` | int [0, 60000] | 0（关闭） | 窗口内到达的多条唤醒行合并为一条通知（前 10 行、每行 200 字符）。 |
+| `coalesce_ms` | int [0, 60000] | 500 | 窗口内到达的多条唤醒行合并为一条通知（前 10 行、每行 200 字符；一个批次对 `max_events` 计 1 次）。默认开启——高频突发输出按批次而非按行计通知。传 0 关闭。 |
 
 立即返回监控记录（`mon_...` id、状态、计数器）。
 
@@ -157,6 +157,7 @@ cd opencode-monitor-task
 
 ## 行为保证
 
+- **合并** — 500ms 窗口内（默认 `coalesce_ms`）到达的唤醒行合并为一条通知：前 10 行、每行 200 字符，其余以计数标注。一个批次对 `max_events` 与令牌桶均计 1 次。传 `coalesce_ms: 0` 关闭。
 - **节流** — 令牌桶：突发 5 条 + 每秒 1 条；超限行丢弃（计数，不缓存）
 - **生命周期** — `starting`（进程拉起中，计入并发上限）→ `running` → 终态；记录携带实时 `pid`
 - **空闲裁决** — `idle_timeout_ms` 到期不直接杀静默命令：状态转为 `idle`、命令继续运行、唤醒通知请 agent 裁决（`monitor_keepalive` 保留 / `monitor_stop` 立即杀）。一个完整窗口的宽限期内无决定才自动杀；期间命令恢复输出则自愈回 `running`

@@ -372,6 +372,9 @@ test("max_events stops the monitor early", async () => {
     const r = await h.reg.start({
       command: "printf 'm1\\nm2\\nm3\\nm4\\nm5\\n'",
       max_events: 2,
+      // Pin merging OFF: this test asserts the per-line ceiling semantics
+      // (default coalescing would batch all 5 lines into one event).
+      coalesce_ms: 0,
       executeContext: EXEC_CTX,
     })
     assert.ok(r.ok)
@@ -393,6 +396,9 @@ test("token bucket drops lines beyond the burst", async () => {
   try {
     const r = await h.reg.start({
       command: "printf 't1\\nt2\\nt3\\nt4\\nt5\\nt6\\nt7\\nt8\\n'",
+      // Pin merging OFF: with default coalescing all 8 lines would merge
+      // into a single batch and the bucket would never engage.
+      coalesce_ms: 0,
       executeContext: EXEC_CTX,
     })
     assert.ok(r.ok)
@@ -551,6 +557,7 @@ test("lifecycle notification bypasses the token bucket", async () => {
   try {
     const r = await h.reg.start({
       command: "printf 'k1\\nk2\\nk3\\nk4\\nk5\\nk6\\nk7\\nk8\\n'",
+      coalesce_ms: 0, // pin OFF — this test exercises the token bucket path
       executeContext: EXEC_CTX,
     })
     assert.ok(r.ok)
@@ -643,6 +650,7 @@ test("pattern filters wake lines and counts scanned/matched", async () => {
     const r = await h.reg.start({
       command: "printf 'noise-a\\nHIT one\\nnoise-b\\nHIT two\\nnoise-c\\n'",
       pattern: "HIT",
+      coalesce_ms: 0, // pin OFF — asserts one notification per matching line
       executeContext: EXEC_CTX,
     })
     assert.ok(r.ok)
@@ -702,6 +710,7 @@ test("wake_mode=all with pattern keeps all lines wakeable but counts matches", a
       command: "printf 'noise-x\\nHIT y\\nnoise-z\\n'",
       pattern: "HIT",
       wake_mode: "all",
+      coalesce_ms: 0, // pin OFF — asserts one event per line in all mode
       executeContext: EXEC_CTX,
     })
     assert.ok(r.ok)
@@ -776,6 +785,27 @@ test("delivery-field rejection degrades to a fieldless retry for queue content a
     for (const n of h.notifications) {
       assert.equal(n.delivery, undefined, "every delivery arrived without the field")
     }
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("default coalesce_ms (500) batches burst lines without being asked", async () => {
+  const h = makeHarness()
+  try {
+    // No coalesce_ms passed: the 500ms default must merge the burst into a
+    // single notification event (P2 high-frequency governance baseline).
+    const r = await h.reg.start({
+      command: "printf 'd1\\nd2\\nd3\\nd4\\n'",
+      executeContext: EXEC_CTX,
+    })
+    assert.ok(r.ok)
+    assert.equal(r.monitor.coalesce_ms, 500, "default is reflected in the start result")
+    await waitFor(() => firstInfo(h).state === "completed")
+    await waitFor(() => h.notifications.some((n) => n.text.includes("coalesced")))
+    const batch = h.notifications.find((n) => n.text.includes("coalesced"))
+    assert.ok(batch!.text.includes("[4 lines coalesced]"), batch!.text)
+    assert.equal(firstInfo(h).events_sent, 1, "one batch = one event against max_events")
   } finally {
     h.cleanup()
   }

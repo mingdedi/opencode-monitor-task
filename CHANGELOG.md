@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `coalesce_ms` now defaults to 500 (previously 0/off): wake lines arriving
+  within a 500ms window merge into one notification by default — one batch
+  counts as a single event against `max_events` and the token bucket.
+  Explicit `coalesce_ms: 0` still opts out.
+
 ## [0.1.0] - 2026-09-22
 
 Initial public release.

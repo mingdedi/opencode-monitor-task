@@ -1,5 +1,6 @@
 import type { Registry } from "./registry"
 import {
+  COALESCE_DEFAULT,
   COALESCE_LIMIT,
   IDLE_TIMEOUT_DEFAULT,
   IDLE_TIMEOUT_LIMIT,
@@ -17,7 +18,7 @@ export function createTools(registry: Registry): ToolDefinition[] {
       "Use it for stage-marked long jobs (training runs, builds, test suites), `tail -f` log watching, or health polling.",
       "STRONGLY RECOMMENDED: pass `pattern` (a regex) so only meaningful lines wake you — noisy lines are counted in lines_scanned but discarded, saving context tokens and shrinking the prompt-injection surface (e.g. pattern=\"epoch.*done|ERROR|FAILED\").",
       "The command must be non-interactive (stdin is closed) and must not append '&' — backgrounding is managed for you.",
-      "Output is rate-limited (burst 5, then 1/s; excess lines are dropped, counted in monitor_list). `coalesce_ms` merges bursts of wake lines into one notification.",
+      "Output is rate-limited (burst 5, then 1/s; excess lines are dropped, counted in monitor_list). Wake lines arriving within a short window are merged into one notification by default (`coalesce_ms`, default 500ms) — high-frequency output costs one event per batch, not one per line.",
       "Stops automatically when the command exits or when max_events is reached; an idle_timeout_ms expiry asks the agent first (keepalive vs kill) instead of killing a silent command outright. The exit status is sent as a final notification.",
       "Returns immediately with a monitor id. Stop early with monitor_stop; inspect states with monitor_list.",
     ].join(" "),
@@ -64,7 +65,7 @@ export function createTools(registry: Registry): ToolDefinition[] {
         },
         coalesce_ms: {
           type: "integer",
-          description: `Merge wake lines arriving within this window into ONE notification (0 disables, max ${COALESCE_LIMIT}). Great for error storms: 50 ERROR lines become one event.`,
+          description: `Merge wake lines arriving within this window into ONE notification (first 10 lines, 200 chars each; the batch counts as a single event). Default ${COALESCE_DEFAULT}ms — bursts of high-frequency output become one notification instead of one per line. 0 disables merging; max ${COALESCE_LIMIT}.`,
         },
       },
       required: ["command"],

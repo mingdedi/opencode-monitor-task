@@ -7,7 +7,9 @@ export const MAX_EVENTS_DEFAULT = 50
 export const MAX_EVENTS_LIMIT = 10_000
 export const IDLE_TIMEOUT_DEFAULT = 300_000
 export const IDLE_TIMEOUT_LIMIT = 600_000
-export const COALESCE_DEFAULT = 0
+// Default ON: wake lines arriving within a 500ms window merge into one
+// notification event (high-frequency output is batched by default; 0 opts out).
+export const COALESCE_DEFAULT = 500
 export const COALESCE_LIMIT = 60_000
 
 export type WakeMode = "all" | "pattern"
