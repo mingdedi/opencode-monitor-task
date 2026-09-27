@@ -76,7 +76,7 @@ test("rejects out-of-range or non-integer parameters", () => {
     { max_events: 1.5 },
     { max_events: "100" },
     { idle_timeout_ms: 0 },
-    { idle_timeout_ms: 600_001 },
+    { idle_timeout_ms: 3_600_001 },
     { idle_timeout_ms: 12.5 },
   ]) {
     const r = validateParams(input)
@@ -87,7 +87,7 @@ test("rejects out-of-range or non-integer parameters", () => {
 test("accepts boundary values", () => {
   assert.ok(!validateParams({ max_events: 10_000 }).error)
   assert.ok(!validateParams({ max_events: 1 }).error)
-  assert.ok(!validateParams({ idle_timeout_ms: 600_000 }).error)
+  assert.ok(!validateParams({ idle_timeout_ms: 3_600_000 }).error)
   assert.ok(!validateParams({ idle_timeout_ms: 1 }).error)
 })
 

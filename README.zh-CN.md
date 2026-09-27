@@ -134,7 +134,7 @@ cd opencode-monitor-task
 | `command` | string，必填 | — | 要执行的 shell 命令。尾部 `&` 自动移除；非末尾孤立 `&` 拒绝（`&&` 允许；fd 重定向如 `2>&1` 及引号内的 `&` 不受影响）。`$(...)`、反引号、`<(...)`、`>(...)` 直接拒绝。 |
 | `description` | string ≤ 80 字符 | — | 展示在每条通知里的简短说明。 |
 | `max_events` | int (0, 10000] | 50 | 通知数上限，达到即停止（并杀掉命令）。这是 agent 可调的安全上限而非固定预算——长任务/高输出任务请按"时长 × 唤醒频率"自行估算并传合适值；运行中还可用 `monitor_update` 调整。越界值拒绝而非截断。 |
-| `idle_timeout_ms` | int (0, 600000] | 300000 | 命令静默超过该时长**不会**被直接杀掉：agent 收到裁决通知——`monitor_keepalive` 重置计时器，`monitor_stop` 立即杀，一个窗口的宽限期内不做决定才自动杀。期间命令恢复输出则自愈回 `running`。 |
+| `idle_timeout_ms` | int (0, 3600000] | 300000 | 命令静默超过该时长**不会**被直接杀掉：agent 收到裁决通知——`monitor_keepalive` 重置计时器，`monitor_stop` 立即杀，一个窗口的宽限期内不做决定才自动杀。期间命令恢复输出则自愈回 `running`。 |
 | `directory` | 绝对路径 | 工作区根 | 命令工作目录；必须解析到项目工作区内。默认值从插件实例的工作区（`ctx.location`）解析——即使在共享 OpenCode 服务（其自身 cwd 为 `$HOME`）下也正确。 |
 | `pattern` | 正则 | — | 仅命中行唤醒；未命中行计入 `lines_scanned`。非法正则带引擎错误拒绝。 |
 | `wake_mode` | `all` \| `pattern` | 隐式 | 有 `pattern` 时为 `pattern`，否则 `all`。`all`+pattern 只统计不过滤。 |

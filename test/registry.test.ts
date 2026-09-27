@@ -459,7 +459,7 @@ test("rejects dangerous or invalid inputs", async () => {
       { command: "sleep 1 & echo hi" },
       { command: "" },
       { command: "echo ok", max_events: 10_001 },
-      { command: "echo ok", idle_timeout_ms: 700_000 },
+      { command: "echo ok", idle_timeout_ms: 3_700_000 },
       { command: "echo ok", idle_timeout_ms: 1.5 },
       { command: "echo ok", directory: "/usr" },
       { command: "echo ok", directory: "relative/path" },
