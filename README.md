@@ -140,6 +140,7 @@ Then restart the TUI; `/tmp/opencode-monitor-tui.log` should show `claimed sideb
 | `wake_mode` | `all` \| `pattern` | implicit | `pattern` when `pattern` is given, else `all`. `all` + `pattern` counts matches but does not filter. |
 | `delivery` | `queue` \| `steer` | `queue` | What to do when the session is busy. Lifecycle notices are always queued. |
 | `coalesce_ms` | int [0, 60000] | 500 | Merge wake lines arriving within this window into one notification (first 10 lines, 200 chars each; one batch = one event against `max_events`). On by default — bursts of high-frequency output cost one notification per batch. 0 disables. |
+| `mode` | `attached` \| `detached` | `attached` | Lifetime mode. `attached`: the command dies with the OpenCode service (pipes + host-exit guards). `detached` (Linux only): the command **survives** service death/restart — output is appended to a per-task log file, the exit code is recorded by a wrapper, and the next service start reattaches automatically (missed lines summarized in ONE notification, not replayed; idle timer restarts from zero). Stop works exactly the same (`monitor_stop`). |
 
 Returns immediately with the monitor record (`mon_...` id, state, counters).
 
@@ -168,7 +169,8 @@ Running and finished (up to 200 retained), with state, counters (`events_sent` /
 - **Auto-stop** — any of: `max_events` reached, idle grace expired without a keepalive, command exit. On exit: code 0 → `completed`; non-zero → `failed: Exit code N`; signal → `failed: Killed by signal SIGxxx`.
 - **Output pipeline** — stdout+stderr merged, ANSI stripped, blank lines dropped, lines split on `\n`/`\r`/`\r\n` (progress-bar friendly), 64 KB no-newline soft wrap, 2000-char truncation per line.
 - **Concurrency** — max 16 running monitors per session.
-- **Cleanup** — process-group kill on stop; guards on host exit (`exit`/`SIGTERM`/`SIGINT`) leave zero orphans.
+- **Cleanup (attached)** — process-group kill on stop; guards on host exit (`exit`/`SIGTERM`/`SIGINT`) leave zero orphans.
+- **Detached mode** (`mode: "detached"`, Linux only) — the command runs in its own process group writing to `~/.local/share/opencode/monitor-task/tasks/<id>/` (`log` + `meta.json` + `exit`); it holds **no pipe to the service**, so service death cannot SIGPIPE it and the host-exit guards deliberately skip it. A restarted service scans the store at plugin load and claims its workspace's tasks: counters resume, missed lines arrive as one summary notification (never replayed — a wake cannot be un-missed), the idle clock is frozen while unattended and re-armed from zero on reattach, and `monitor_stop`/`monitor_keepalive`/`monitor_update` work as before. A task that died while unattended is finalized from its exit file **and its owning session is notified** with the outcome (`exit unknown` when the whole group was SIGKILLed); terminal records are swept after a 1h TTL — at every service start and every 10 minutes while any detached task is live. Pid reuse is defended by matching `/proc/<pid>/stat` `starttime`, and zombie wrappers (non-reaping PID 1) are detected via the `/proc` state letter. No log rotation: watch `log_bytes` via `monitor_list` for long runs.
 
 ## Security notes
 

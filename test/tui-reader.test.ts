@@ -44,6 +44,7 @@ function m(state: PublicInfo["state"], id = "mon_x1"): PublicInfo {
     command: "sleep 1",
     description: "",
     state,
+    mode: "attached",
     pid: state === "running" ? 42 : null,
     session_id: "unused",
     events_sent: 0,
@@ -61,6 +62,8 @@ function m(state: PublicInfo["state"], id = "mon_x1"): PublicInfo {
     stopped_at: state === "running" || state === "starting" ? null : "2026-09-22T10:00:05Z",
     exit_info: state === "running" || state === "starting" ? null : "exit code 0",
     idle_deadline: state === "idle" ? "2026-09-22T10:00:10Z" : null,
+    reattached: false,
+    log_bytes: null,
   }
 }
 

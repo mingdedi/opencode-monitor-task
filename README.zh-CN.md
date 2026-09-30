@@ -140,6 +140,7 @@ cd opencode-monitor-task
 | `wake_mode` | `all` \| `pattern` | 隐式 | 有 `pattern` 时为 `pattern`，否则 `all`。`all`+pattern 只统计不过滤。 |
 | `delivery` | `queue` \| `steer` | `queue` | 会话正忙时的投递方式。生命周期通知恒为 `queue`。 |
 | `coalesce_ms` | int [0, 60000] | 500 | 窗口内到达的多条唤醒行合并为一条通知（前 10 行、每行 200 字符；一个批次对 `max_events` 计 1 次）。默认开启——高频突发输出按批次而非按行计通知。传 0 关闭。 |
+| `mode` | `attached` \| `detached` | `attached` | 生命周期模式。`attached`：命令与 OpenCode 服务共存亡（管道 + 宿主退出守卫）。`detached`（仅 Linux）：命令**独立于**服务的死亡/重启存活——输出落盘到任务专属日志文件，退出码由 wrapper 记录，服务重启后自动重新挂载（缺席期间的行合并为一条摘要通知、不逐行重放；空闲计时从零重新武装）。停止方式不变（`monitor_stop`）。 |
 
 立即返回监控记录（`mon_...` id、状态、计数器）。
 
@@ -168,7 +169,8 @@ cd opencode-monitor-task
 - **自动停止** — 三条件任一：`max_events` 达标 / 宽限期到仍无 keepalive / 命令退出。退出映射：exit 0 → `completed`；非零 → `failed: Exit code N`；信号 → `failed: Killed by signal SIGxxx`
 - **输出处理** — stdout+stderr 合流、去 ANSI、去空行、按 `\n`/`\r`/`\r\n` 分行（兼容进度条输出）、64KB 无换行软换行、单行截断 2000 字符
 - **并发** — 每会话最多 16 个运行中的监控
-- **清理** — 停止时进程组级击杀；宿主退出（`exit`/`SIGTERM`/`SIGINT`）守卫，零孤儿
+- **清理（attached）** — 停止时进程组级击杀；宿主退出（`exit`/`SIGTERM`/`SIGINT`）守卫，零孤儿
+- **detached 模式**（`mode: "detached"`，仅 Linux）— 命令自成进程组，输出落盘到 `~/.local/share/opencode/monitor-task/tasks/<id>/`（`log` + `meta.json` + `exit`）；与**服务之间不持有任何管道**，服务死亡无法 SIGPIPE 它，宿主退出守卫对其有意豁免。服务重启后插件加载时扫描任务存储并认领本工作区的任务：计数恢复、缺席期间的行合并为一条摘要通知（绝不逐行重放——错过的唤醒无法补发生）、空闲计时在缺席期间冻结并在重挂时从零重新武装，`monitor_stop`/`monitor_keepalive`/`monitor_update` 照常工作。缺席期间死亡的任务凭 exit 文件收尾并**通知所属会话**结果（进程组被整体 SIGKILL 时标 `exit unknown`）；终态记录 1 小时 TTL 后清理——每次服务启动必扫一次，有 detached 任务存活期间每 10 分钟一次。pid 复用由 `/proc/<pid>/stat` 的 `starttime` 双因子防御；僵尸 wrapper（PID 1 不收割的环境）凭 `/proc` state 字母识别为已退出。无日志轮转：长任务通过 `monitor_list` 的 `log_bytes` 留意磁盘占用。
 
 ## 安全提示
 

@@ -1,19 +1,41 @@
 import { spawn, type ChildProcess } from "node:child_process"
+import { closeSync, mkdirSync, openSync } from "node:fs"
+import { realpathSync } from "node:fs"
+import { join } from "node:path"
 import { cleanLine } from "./clean"
 import { newMonitorId } from "./ids"
 import { log } from "./log"
 import type { SessionResolver } from "./session-resolver"
+import { stateDir } from "./state"
 import { TokenBucket } from "./throttle"
+import {
+  buildWrapperScript,
+  isTerminalTaskState,
+  listTaskDirs,
+  readExitCode,
+  readMeta,
+  readProcFields,
+  sweepTaskDirs,
+  taskDirOf,
+  taskExitPath,
+  taskLogPath,
+  writeMeta,
+  WRAPPER_EXIT_ENV,
+  type DetachedMeta,
+} from "./taskstore"
+import { createTail, type TailHandle } from "./tail"
 import type { PluginContext } from "./types"
 import {
   validateCommand,
   validateCoalesce,
   validateDelivery,
   validateDirectory,
+  validateMode,
   validateParams,
   validatePattern,
   validateWakeMode,
   type Delivery,
+  type MonitorMode,
   type WakeMode,
 } from "./validate"
 
@@ -35,6 +57,19 @@ const COALESCE_MAX_SHOWN = 10
 const COALESCE_SHOWN_WIDTH = 200
 // Hard cap on pending coalesced lines so a firehose cannot grow memory.
 const MAX_PENDING_LINES = 1000
+// Detached meta flush cadence while a detached monitor is live: bounds how
+// much of the log a reattach re-reads as silent history after a hard
+// crash (graceful paths flush immediately).
+const META_FLUSH_MS = 5000
+// Task-store TTL sweep cadence inside the meta flusher. The TTL itself is
+// 1h (TASK_TTL_MS), so a coarse cadence is fine — sweeping on every 5s
+// flush tick would be pure IO waste. A sweep also runs at the head of
+// every reattachDetached scan (service start), the one moment the store
+// is guaranteed to be visited even when no detached task ever goes live
+// in this service lifetime.
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000
+// Preview lines kept during a silent reattach replay for the summary note.
+const REPLAY_PREVIEW_LINES = 5
 
 // "idle" = idle_timeout_ms elapsed without output; the command is STILL
 // ALIVE and the agent is asked to decide (keepalive vs kill) within one
@@ -47,6 +82,9 @@ interface MonitorEntry {
   description: string
   sessionID: string | null
   state: MonitorState
+  /** Lifetime mode (M9): attached dies with the service; detached survives
+   *  it via the task store (log file + meta + exit file) and reattaches. */
+  mode: MonitorMode
   child: ChildProcess | null
   pid: number | null
   startedAt: number
@@ -78,6 +116,22 @@ interface MonitorEntry {
   idleDeadline: number | null
   killTimer: ReturnType<typeof setTimeout> | null
   finalized: boolean
+  // --- detached-mode fields (null/0 for attached) -----------------------
+  /** Task store directory (meta/log/exit), or null for attached monitors. */
+  taskDir: string | null
+  /** Tail reader over the task log; stopped on finalize/dispose. */
+  tail: TailHandle | null
+  /** True while reattach replays history: lines are counted and previewed
+   *  but never dispatched (the old session cannot be un-missed). */
+  silent: boolean
+  /** Counters as of the reattach claim — the "+N lines while away" base. */
+  replayBase: { scanned: number; matched: number } | null
+  /** Rolling preview of replayed lines for the reattach summary note. */
+  replayPreview: string[]
+  /** True when this entry was claimed from the task store, not spawned here. */
+  reattached: boolean
+  /** Consumed log bytes (== resume offset); surfaced as log_bytes. */
+  logBytes: number
 }
 
 export interface PublicInfo {
@@ -85,6 +139,9 @@ export interface PublicInfo {
   command: string
   description: string
   state: MonitorState
+  /** Lifetime mode: "attached" (dies with the service) or "detached"
+   *  (survives the service; reattaches from the task store). */
+  mode: MonitorMode
   pid: number | null
   /** Owning session (state bridge groups by this; always set in practice). */
   session_id: string | null
@@ -104,6 +161,12 @@ export interface PublicInfo {
   exit_info: string | null
   /** Set while state === "idle": when the grace window kills the command. */
   idle_deadline: string | null
+  /** True when this monitor was re-claimed from the task store after a
+   *  service restart (detached only). */
+  reattached: boolean
+  /** Detached only: consumed log bytes (≈ log size; visibility for disk
+   *  usage — no rotation in M9). Null for attached monitors. */
+  log_bytes: number | null
 }
 
 export type StartResult =
@@ -121,6 +184,7 @@ export interface Registry {
     wake_mode?: unknown
     delivery?: unknown
     coalesce_ms?: unknown
+    mode?: unknown
     executeContext: unknown
   }): Promise<StartResult>
   stop(id: string): { ok: boolean; message: string }
@@ -138,6 +202,16 @@ export interface Registry {
    */
   update(id: string, maxEvents: number | null): { ok: boolean; message: string }
   list(): PublicInfo[]
+  /**
+   * Scan the detached task store and claim tasks that belong to this
+   * registry's workspace (M9). Alive tasks are re-armed (tail from
+   * last_offset, counters restored, idle re-armed per the frozen-clock
+   * semantics) and their owners get one summary notification; tasks that
+   * died while unattended are finalized from their exit files. Idempotent:
+   * already-claimed / already-known tasks are skipped. Returns the number
+   * of live tasks claimed. Runs once automatically at registry creation.
+   */
+  reattachDetached(): Promise<number>
   stopAll(reason: string): void
   /** Stop everything and detach from process guards (plugin unload). */
   dispose(): void
@@ -150,6 +224,8 @@ export interface RegistryOptions {
   rootDir?: string
   /** Max finished monitors retained in the registry. Default 200. */
   maxRetained?: number
+  /** Base dir of the detached task store. Default stateDir(). */
+  tasksBase?: string
   /** Mutation callback (state bridge, tests). Fired after every registry change. */
   onChange?: () => void
 }
@@ -226,7 +302,13 @@ export function createRegistry(
   // different eras (M2: cwd; M6 re-verified location on v2.0.11).
   const rootDir = options.rootDir ?? resolveRootDir(ctx)
   const maxRetained = options.maxRetained ?? MAX_RETAINED
+  const tasksBase = options.tasksBase ?? stateDir()
   const monitors = new Map<string, MonitorEntry>()
+  // Lazy 5s flusher for live detached metas (see ensureMetaFlusher).
+  let metaFlushTimer: ReturnType<typeof setInterval> | null = null
+  // Next due TTL sweep (epoch ms); 0 = sweep on the next flusher tick.
+  // Reset by ensureMetaFlusher so every flusher lifetime opens with a sweep.
+  let nextSweepAt = 0
   const notifyChange = () => {
     try {
       options.onChange?.()
@@ -243,6 +325,7 @@ export function createRegistry(
       command: e.command,
       description: e.description,
       state: e.state,
+      mode: e.mode,
       pid: e.pid,
       session_id: e.sessionID,
       events_sent: e.eventsSent,
@@ -260,6 +343,8 @@ export function createRegistry(
       stopped_at: e.stoppedAt ? new Date(e.stoppedAt).toISOString() : null,
       exit_info: e.exitInfo,
       idle_deadline: e.idleDeadline ? new Date(e.idleDeadline).toISOString() : null,
+      reattached: e.reattached,
+      log_bytes: e.mode === "detached" ? e.logBytes : null,
     }
   }
 
@@ -392,7 +477,9 @@ export function createRegistry(
    * where timers can no longer fire.
    */
   function killGroup(e: MonitorEntry, immediate = false): void {
-    const pid = e.child?.pid
+    // Reattached detached monitors have no child handle — the recorded pid
+    // (= pgid for detached spawns) is still a valid group target.
+    const pid = e.child?.pid ?? e.pid
     if (!pid) return
     const send = (sig: NodeJS.Signals) => {
       try {
@@ -439,6 +526,16 @@ export function createRegistry(
     clearIdle(e)
     clearGrace(e)
     if (state === "stopped" || state === "failed") killGroup(e)
+    if (e.mode === "detached") {
+      // Record the terminal state in the store — this is what the next
+      // service start (and the TTL sweeper) will see. Flush BEFORE
+      // stopping the tail: the live handle carries the true offset.
+      if (state === "completed" || state === "failed" || state === "stopped") {
+        flushDetachedMeta(e, state)
+      }
+      e.tail?.stop()
+      e.tail = null
+    }
     log(`${e.id}: finalized state=${state} exit="${exitInfo}"`)
     // A coalescing batch that has not hit its window yet still belongs to the
     // agent — flush it before the lifecycle notice (no tail loss).
@@ -543,12 +640,51 @@ export function createRegistry(
         return // filtered out: counted in lines_scanned, never wakes
       }
     }
+    if (e.silent) {
+      // Reattach replay: history is counted (and previewed for the
+      // summary note) but never dispatched — the missed lines cannot be
+      // un-missed, and re-firing them would storm the session.
+      e.replayPreview.push(line)
+      if (e.replayPreview.length > REPLAY_PREVIEW_LINES) e.replayPreview.shift()
+      return
+    }
     if (e.state !== "running" || e.finalized) return
     if (e.coalesceMs > 0) {
       queueCoalesceLine(e, line)
       return
     }
     dispatchLine(e, line)
+  }
+
+  /**
+   * Shared chunk pipeline for both sources: attached pipes (stream "data"
+   * events) and detached log tails. Handles idle self-heal, idle re-arm
+   * and the line buffering (split on \n as well as \r / \r\n: progress-bar
+   * style output overwrites lines with bare \r), plus the 64KB soft-wrap
+   * guard for streams that never emit a newline.
+   */
+  function feedChunk(
+    e: MonitorEntry,
+    chunk: string,
+    key: "outBuffer" | "errBuffer",
+  ) {
+    if (e.state === "idle") {
+      // The command broke its silence during the grace window — the
+      // arbitration question answered itself. Revive first so this chunk
+      // flows through the normal pipeline (it can still wake the agent).
+      resumeRunning(e, "new output during idle grace")
+    }
+    if (e.state !== "running") return
+    armIdle(e) // any output resets the idle timer, even throttled lines
+    const buffer = (e[key] += chunk)
+    const parts = buffer.split(/\r\n|\r|\n/)
+    e[key] = parts.pop() ?? ""
+    for (const part of parts) emitLine(e, part)
+    if (e[key].length > MAX_LINE_BUFFER) {
+      const rest = e[key]
+      e[key] = ""
+      emitLine(e, rest)
+    }
   }
 
   function attachStream(
@@ -558,30 +694,7 @@ export function createRegistry(
   ) {
     if (!stream) return
     stream.setEncoding("utf8")
-    stream.on("data", (chunk: string) => {
-      if (e.state === "idle") {
-        // The command broke its silence during the grace window — the
-        // arbitration question answered itself. Revive first so this chunk
-        // flows through the normal pipeline (it can still wake the agent).
-        resumeRunning(e, "new output during idle grace")
-      }
-      if (e.state !== "running") return
-      armIdle(e) // any output resets the idle timer, even throttled lines
-      const buffer = (e[key] += chunk)
-      // Split on \n as well as \r / \r\n: progress-bar style output
-      // (pip, docker, tqdm) overwrites lines with bare \r and would otherwise
-      // never produce a "line" at all.
-      const parts = buffer.split(/\r\n|\r|\n/)
-      e[key] = parts.pop() ?? ""
-      for (const part of parts) emitLine(e, part)
-      // Soft-wrap guard: a stream with no newline at all must not grow the
-      // buffer without bound. cleanLine() truncates the emitted line anyway.
-      if (e[key].length > MAX_LINE_BUFFER) {
-        const rest = e[key]
-        e[key] = ""
-        emitLine(e, rest)
-      }
-    })
+    stream.on("data", (chunk: string) => feedChunk(e, chunk, key))
     stream.on("error", (err) => log(`${e.id} stream error: ${String(err)}`))
   }
 
@@ -591,8 +704,409 @@ export function createRegistry(
     if (rest.trim().length > 0) emitLine(e, rest)
   }
 
+  // -------------------------------------------------- detached (M9) helpers
+
+  function ensureMetaFlusher(): void {
+    if (metaFlushTimer) return
+    nextSweepAt = 0 // a fresh flusher lifetime always opens with a sweep
+    metaFlushTimer = setInterval(() => {
+      let live = 0
+      for (const e of monitors.values()) {
+        if (e.mode === "detached" && !e.finalized) {
+          flushDetachedMeta(e)
+          live++
+        }
+      }
+      // Opportunistic TTL sweep of the task store. Runs on the first tick
+      // of every flusher lifetime (nextSweepAt starts at 0) and then at
+      // SWEEP_INTERVAL_MS cadence — the store is only visited while some
+      // detached task is live here, so a terminal dir left behind by the
+      // LAST task of a lifetime is picked up by the next service start's
+      // reattach sweep instead.
+      if (Date.now() >= nextSweepAt) {
+        nextSweepAt = Date.now() + SWEEP_INTERVAL_MS
+        const removed = sweepTaskDirs(tasksBase)
+        if (removed > 0) log(`task store: TTL sweep removed ${removed} dir(s)`)
+      }
+      // Nothing to watch anymore — don't keep a timer warm.
+      if (live === 0) stopMetaFlusher()
+    }, META_FLUSH_MS)
+    metaFlushTimer.unref?.()
+  }
+
+  function stopMetaFlusher(): void {
+    if (metaFlushTimer) {
+      clearInterval(metaFlushTimer)
+      metaFlushTimer = null
+    }
+  }
+
+  /** Snapshot a live (or about-to-finalize) detached entry into the store. */
+  function flushDetachedMeta(e: MonitorEntry, state?: DetachedMeta["state"]): void {
+    if (e.mode !== "detached" || !e.taskDir) return
+    const offset = e.tail?.getOffset() ?? e.logBytes
+    if (e.tail) e.logBytes = offset
+    const proc = e.pid ? readProcFields(e.pid) : null
+    writeMeta(e.taskDir, {
+      schema: 1,
+      id: e.id,
+      command: e.command,
+      description: e.description,
+      sessionID: e.sessionID,
+      pid: e.pid ?? 0,
+      pgid: e.pid ?? 0,
+      procStartTime: proc?.starttime ?? "",
+      startedAt: e.startedAt,
+      directory: e.directory,
+      pattern: e.patternSource,
+      wakeMode: e.wakeMode,
+      delivery: e.delivery,
+      coalesceMs: e.coalesceMs,
+      maxEvents: e.maxEvents,
+      idleTimeoutMs: e.idleTimeoutMs,
+      workspace: tasksWorkspace(),
+      lastOffset: offset,
+      linesScanned: e.linesScanned,
+      linesMatched: e.linesMatched,
+      eventsSent: e.eventsSent,
+      eventsDropped: e.eventsDropped,
+      state: state ?? (e.state === "idle" ? "idle" : "running"),
+      exitInfo: state && isTerminalTaskState(state) ? e.exitInfo : null,
+      claimedBy: state && isTerminalTaskState(state) ? null : process.pid,
+      updatedAt: Date.now(),
+    })
+  }
+
+  /** Workspace identity recorded in metas: rootDir, realpath-normalised
+   *  when possible (survives symlinked clones swapping underneath). */
+  function tasksWorkspace(): string {
+    try {
+      return realpathSync(rootDir)
+    } catch {
+      return rootDir
+    }
+  }
+
+  function probeDetached(e: MonitorEntry): void {
+    if (e.finalized || e.state === "starting") return
+    if (e.state !== "running" && e.state !== "idle") return
+    if (!e.pid) return
+    try {
+      process.kill(e.pid, 0)
+      // Signal 0 succeeds on ZOMBIES too. A reattached wrapper has no
+      // parent waiting on it (the spawning service died), so in
+      // non-reaping environments (bare docker / devcontainer PID 1) it
+      // stays undead forever — and would hold this monitor in "running"
+      // until idle-grace misreports it as stopped. The /proc state letter
+      // tells the exited apart from the living; an unreadable stat is no
+      // verdict, so stay conservative and keep watching.
+      const proc = readProcFields(e.pid)
+      if (!proc || proc.state !== "Z") return // still alive
+      log(`${e.id}: pid ${e.pid} is a zombie — treating as exited`)
+    } catch {
+      // fall through: dead
+    }
+    // Died possibly-unattended: the wrapper's exit file is the authority;
+    // its absence means the whole group was killed before the wrapper
+    // could record anything.
+    const code = e.taskDir ? readExitCode(e.taskDir) : null
+    if (code === 0) {
+      finalize(e, "completed", "exit code 0 (recorded while unattended)")
+    } else if (code !== null) {
+      finalize(e, "failed", `Exit code ${code} (recorded while unattended)`)
+    } else {
+      finalize(e, "failed", "process died while unattended (exit code unknown)")
+    }
+  }
+
+  /**
+   * Spawn a detached monitor: the command is wrapped in a bash shell that
+   * appends combined stdout/stderr to the task log and records the exit
+   * code; the service holds NO pipe to the process, so its death cannot
+   * SIGPIPE the command. The tail reader turns the log file back into the
+   * same streaming pipeline attached monitors use.
+   */
+  function spawnDetached(entry: MonitorEntry): { ok: true } | { ok: false; error: string } {
+    const dir = taskDirOf(entry.id, tasksBase)
+    const logPath = taskLogPath(dir)
+    const exitPath = taskExitPath(dir)
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch (err) {
+      finalize(entry, "failed", `failed to create task dir: ${String(err)}`)
+      return { ok: false, error: `failed to create task dir: ${String(err)}` }
+    }
+    let logFd: number
+    try {
+      logFd = openSync(logPath, "a")
+    } catch (err) {
+      finalize(entry, "failed", `failed to open log file: ${String(err)}`)
+      return { ok: false, error: `failed to open log file: ${String(err)}` }
+    }
+    const script = buildWrapperScript(entry.command)
+    let child: ChildProcess
+    try {
+      child = spawn("bash", ["-c", script], {
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        cwd: entry.directory ?? rootDir,
+        env: { ...process.env, [WRAPPER_EXIT_ENV]: exitPath },
+      })
+    } catch (err) {
+      try {
+        closeSync(logFd)
+      } catch {
+        // ignore
+      }
+      finalize(entry, "failed", `failed to spawn: ${String(err)}`)
+      return { ok: false, error: `failed to spawn: ${String(err)}` }
+    }
+    // The child holds inherited dups; the parent copy is not needed.
+    try {
+      closeSync(logFd)
+    } catch {
+      // ignore
+    }
+    if (!child.pid) {
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        // already gone
+      }
+      finalize(entry, "failed", "failed to spawn: no pid")
+      return { ok: false, error: "failed to spawn: no pid" }
+    }
+    // Detached semantics: the event loop must not keep the SERVICE alive
+    // for the monitor, and exit events still fire while it is alive.
+    child.unref()
+
+    entry.taskDir = dir
+    entry.child = child
+    entry.pid = child.pid
+    flushDetachedMeta(entry) // pid + starttime captured here
+    entry.tail = createTail({
+      path: logPath,
+      startOffset: 0,
+      onChunk: (c) => feedChunk(entry, c, "outBuffer"),
+      onTick: () => probeDetached(entry),
+    })
+    entry.state = "running"
+    ensureMetaFlusher()
+    child.on("error", (err) => {
+      log(`${entry.id}: spawn error ${String(err)}`)
+      finalize(entry, "failed", String(err))
+    })
+    child.on("close", (code, signal) => {
+      if (entry.finalized) return
+      // Prefer the wrapper's recorded code — `code` here is the wrapper's
+      // own exit, which mirrors it (`exit "$_ec"`), but the file is the
+      // source of truth across restarts.
+      const recorded = readExitCode(dir)
+      if (recorded !== null) {
+        if (recorded === 0) finalize(entry, "completed", "exit code 0")
+        else finalize(entry, "failed", `Exit code ${recorded}`)
+      } else if (signal) {
+        finalize(entry, "failed", `Killed by signal ${signal}`)
+      } else if (code === 0) {
+        finalize(entry, "completed", "exit code 0")
+      } else {
+        finalize(entry, "failed", `Exit code ${code}`)
+      }
+    })
+    return { ok: true }
+  }
+
+  /** Rebuild a registry entry from a claimed task-store meta. */
+  function entryFromMeta(meta: DetachedMeta, taskDir: string): MonitorEntry {
+    const entry: MonitorEntry = {
+      id: meta.id,
+      command: meta.command,
+      description: meta.description,
+      sessionID: meta.sessionID,
+      state: "running",
+      mode: "detached",
+      child: null, // not our child — liveness is polled, exits are read
+      pid: meta.pid,
+      startedAt: meta.startedAt,
+      stoppedAt: null,
+      exitInfo: null,
+      eventsSent: meta.eventsSent,
+      eventsDropped: meta.eventsDropped,
+      linesScanned: meta.linesScanned,
+      linesMatched: meta.linesMatched,
+      maxEvents: meta.maxEvents,
+      idleTimeoutMs: meta.idleTimeoutMs,
+      directory: meta.directory,
+      patternSource: meta.pattern,
+      matcher: meta.pattern ? new RegExp(meta.pattern) : null,
+      wakeMode: meta.wakeMode,
+      delivery: meta.delivery,
+      coalesceMs: meta.coalesceMs,
+      pendingLines: [],
+      coalesceTimer: null,
+      deliverChain: Promise.resolve(),
+      bucket: new TokenBucket({
+        capacity: THROTTLE_BURST,
+        refillPerSecond: THROTTLE_REFILL_PER_SECOND,
+      }),
+      outBuffer: "",
+      errBuffer: "",
+      idleTimer: null,
+      graceTimer: null,
+      idleDeadline: null,
+      killTimer: null,
+      finalized: false,
+      taskDir,
+      tail: null,
+      silent: true,
+      replayBase: { scanned: meta.linesScanned, matched: meta.linesMatched ?? 0 },
+      replayPreview: [],
+      reattached: true,
+      logBytes: meta.lastOffset,
+    }
+    return entry
+  }
+
+  /**
+   * The tail first caught up with the log end: everything drained so far
+   * was history. Close the silent replay window with one summary note
+   * (queue mode, no max_events cost — same rules as lifecycle notices)
+   * and re-arm the idle clock per the frozen-clock semantics: absence
+   * froze it, presence restarts it from zero.
+   */
+  function finishReplay(e: MonitorEntry): void {
+    if (!e.silent) return
+    e.silent = false
+    const base = e.replayBase ?? { scanned: 0, matched: 0 }
+    const newLines = e.linesScanned - base.scanned
+    const newMatched = e.linesMatched === null ? null : e.linesMatched - base.matched
+    armIdle(e)
+    notifyChange()
+    log(
+      `${e.id}: reattached (pid ${e.pid}); ${newLines} line(s) replayed silently, resuming at offset ${e.logBytes}`,
+    )
+    if (newLines <= 0) {
+      // Nothing was missed — no summary needed, the monitor just resumes.
+      return
+    }
+    const parts = [
+      `detached monitor ${e.id} reattached (pid ${e.pid}) — the service restarted while it kept running.`,
+      `${newLines} line(s) were logged while away${newMatched === null ? "" : ` (${newMatched} matched the pattern)`}; they are counted in lines_scanned but NOT re-delivered.`,
+      "Latest:",
+      ...e.replayPreview.map((l) => `  ${l}`),
+      `Monitoring resumed (idle timer re-armed at ${e.idleTimeoutMs}ms). monitor_stop / monitor_keepalive work as before.`,
+    ]
+    e.deliverChain = e.deliverChain.then(() =>
+      deliver(e, parts.join("\n"), "queue"),
+    )
+  }
+
+  /**
+   * Scan the task store and claim this workspace's detached tasks (M9).
+   * See Registry.reattachDetached for the contract.
+   */
+  async function reattachDetached(): Promise<number> {
+    let claimed = 0
+    const workspace = tasksWorkspace()
+    // TTL sweep FIRST (service start): expired terminal dirs are removed
+    // before the scan, so the loop below never even iterates them. This
+    // is the only sweep path guaranteed to run regardless of whether any
+    // detached task goes live in this service lifetime.
+    const swept = sweepTaskDirs(tasksBase)
+    if (swept > 0) log(`task store: TTL sweep removed ${swept} dir(s)`)
+    for (const dir of listTaskDirs(tasksBase)) {
+      const meta = readMeta(dir)
+      if (!meta) continue // corrupt: leave for the TTL sweeper
+      if (isTerminalTaskState(meta.state)) continue // terminal: sweeper's
+      // Workspace guard: shared-server instances must not steal tasks
+      // belonging to other projects (same pid, different workspace).
+      let metaWorkspace: string
+      try {
+        metaWorkspace = realpathSync(meta.workspace)
+      } catch {
+        metaWorkspace = meta.workspace
+      }
+      if (metaWorkspace !== workspace) continue
+      // Claim guard: a live claimer (another instance, hot-reload
+      // predecessor that hasn't disposed yet) still owns the watch.
+      if (meta.claimedBy && meta.claimedBy !== process.pid) {
+        try {
+          process.kill(meta.claimedBy, 0)
+          continue // claimer alive — hands off
+        } catch {
+          // dead claimer (crashed service) — claimable below
+        }
+      }
+      if (monitors.has(meta.id)) continue // already ours (idempotency)
+      // Liveness probe with pid-reuse defense: (pid, starttime) must both
+      // match, otherwise the recorded process is gone and the pid may
+      // belong to somebody else entirely. A ZOMBIE passes kill(pid, 0)
+      // and keeps its original starttime, but the process has exited —
+      // same non-reaping-PID-1 defense as probeDetached; its exit file
+      // carries the verdict.
+      const proc = readProcFields(meta.pid)
+      if (!proc || proc.state === "Z" || proc.starttime !== meta.procStartTime) {
+        const code = readExitCode(dir)
+        const state: DetachedMeta["state"] =
+          code === 0 ? "completed" : "failed"
+        const exitInfo =
+          code === 0
+            ? "exit code 0 (recorded while unattended)"
+            : code !== null
+              ? `Exit code ${code} (recorded while unattended)`
+              : "process died while unattended (exit code unknown)"
+        writeMeta(dir, {
+          ...meta,
+          state,
+          exitInfo,
+          claimedBy: null,
+          updatedAt: Date.now(),
+        })
+        log(`reattach ${meta.id}: dead while unattended — recorded "${exitInfo}"`)
+        // The outcome must reach the owning session: a terminal meta is
+        // skipped by every future scan and never enters this registry, so
+        // without a notice the agent has no way to learn how the task
+        // ended. Same channel/rules as the reattach summary: queue mode,
+        // no max_events cost. entryFromMeta is used purely as the
+        // notification carrier (id/description/sessionID) — no tail is
+        // started and nothing is registered.
+        const ghost = entryFromMeta(meta, dir)
+        void deliver(
+          ghost,
+          [
+            `detached monitor ${meta.id} ended while the service was down.`,
+            `monitor ${state}: ${exitInfo}`,
+            "It is finalized in the task store and will not appear in monitor_list.",
+          ].join("\n"),
+          "queue",
+        )
+        continue
+      }
+      // Alive → claim it.
+      writeMeta(dir, { ...meta, claimedBy: process.pid, updatedAt: Date.now() })
+      const e = entryFromMeta(meta, dir)
+      monitors.set(e.id, e)
+      e.tail = createTail({
+        path: taskLogPath(dir),
+        startOffset: meta.lastOffset,
+        onChunk: (c) => feedChunk(e, c, "outBuffer"),
+        onTick: () => probeDetached(e),
+        onCaughtUp: () => finishReplay(e),
+      })
+      ensureMetaFlusher()
+      claimed++
+      log(`reattach ${meta.id}: claimed (pid ${e.pid}, offset ${meta.lastOffset})`)
+    }
+    if (claimed > 0) notifyChange()
+    return claimed
+  }
+
   const killRunningImmediate = () => {
     for (const e of monitors.values()) {
+      // Detached monitors are exempt from host-death guards BY DESIGN:
+      // their whole point is surviving the service. Their store records
+      // (last flushed meta) let the next service start reattach.
+      if (e.mode === "detached") continue
       if (e.state === "running" || e.state === "idle") killGroup(e, true)
     }
   }
@@ -609,6 +1123,7 @@ export function createRegistry(
     wake_mode?: unknown
     delivery?: unknown
     coalesce_ms?: unknown
+    mode?: unknown
     executeContext: unknown
   }): Promise<StartResult> {
     const cmd = validateCommand(input.command)
@@ -631,6 +1146,9 @@ export function createRegistry(
 
     const coal = validateCoalesce(input.coalesce_ms)
     if (coal.error) return { ok: false, error: coal.error }
+
+    const lifetime = validateMode(input.mode)
+    if (lifetime.error) return { ok: false, error: lifetime.error }
 
     const sessionID = await resolver.resolve(input.executeContext)
     if (!sessionID) {
@@ -662,6 +1180,7 @@ export function createRegistry(
       // "starting" is visible to the state bridge/TUI panel until spawn()
       // resolves; spawn errors transition it to "failed" with exit info.
       state: "starting",
+      mode: lifetime.monitorMode!,
       child: null,
       pid: null,
       startedAt: Date.now(),
@@ -693,12 +1212,32 @@ export function createRegistry(
       idleDeadline: null,
       killTimer: null,
       finalized: false,
+      taskDir: null,
+      tail: null,
+      silent: false,
+      replayBase: null,
+      replayPreview: [],
+      reattached: false,
+      logBytes: 0,
     }
 
     // Register before spawn so the panel can show the starting state, and so
     // a spawn failure leaves a traceable "failed" record instead of vanishing.
     monitors.set(entry.id, entry)
     notifyChange()
+
+    // Detached (M9): file-backed spawn that survives the service. The
+    // attached path below is untouched — same pipes, same guards.
+    if (entry.mode === "detached") {
+      const r = spawnDetached(entry)
+      if (!r.ok) return { ok: false, error: r.error }
+      installProcessGuardsOnce() // still installs host-exit cleanup for ATTACHED monitors
+      notifyChange()
+      log(
+        `${entry.id}: started detached (pid ${entry.pid}, pgid ${entry.pid}, cwd ${entry.directory ?? rootDir}) "${cmd.command}" for session ${sessionID}`,
+      )
+      return { ok: true, monitor: publicInfo(entry) }
+    }
 
     let child: ChildProcess
     try {
@@ -847,11 +1386,95 @@ export function createRegistry(
    * Full teardown for plugin unload / hot reload: stop everything and detach
    * from the module-level process guards so a disposed registry no longer
    * keeps closures alive in `liveKillers`.
+   *
+   * Detached monitors are NOT killed — surviving the host is their contract.
+   * They are parked instead: tail stopped, meta flushed with the resume
+   * offset, and `claimedBy` cleared so a successor instance (hot reload in
+   * the same process, or a restarted service) can claim them. If the host
+   * dies right after this, the recorded offset is at most META_FLUSH_MS
+   * stale and the process keeps running on its own process group.
    */
   function dispose(): void {
-    stopAll("registry disposed")
+    for (const e of monitors.values()) {
+      if (
+        e.mode === "detached" &&
+        (e.state === "running" || e.state === "idle") &&
+        !e.finalized
+      ) {
+        // Park BEFORE stopping the tail: the live handle carries the
+        // true resume offset.
+        parkDetached(e)
+        e.tail?.stop()
+        e.tail = null
+        // Drop every timer: the successor re-arms idle from zero on
+        // reattach (frozen-clock semantics), and a lingering 5-minute
+        // setTimeout would pin the host's event loop alive.
+        clearIdle(e)
+        clearGrace(e)
+        if (e.coalesceTimer) {
+          clearTimeout(e.coalesceTimer)
+          e.coalesceTimer = null
+        }
+        // Hand the child off: the successor registry now owns lifecycle
+        // bookkeeping. Keeping our close listener would let a late exit
+        // overwrite the successor's terminal record (observed in tests:
+        // its "stopped" clobbered to "failed" by our stale close path).
+        e.child?.removeAllListeners("close")
+        e.child?.removeAllListeners("error")
+        continue
+      }
+      if (e.state === "running" || e.state === "idle") {
+        finalize(e, "stopped", "registry disposed")
+      }
+    }
     liveKillers.delete(killRunningImmediate)
+    stopMetaFlusher()
   }
 
-  return { start, stop, keepalive, update, list, stopAll, dispose }
+  /** Write a park record: resume offset + no claimer + still "running". */
+  function parkDetached(e: MonitorEntry): void {
+    if (e.mode !== "detached" || !e.taskDir) return
+    // The process is alive at park time (dispose only parks live entries),
+    // so /proc is the authoritative starttime source.
+    const proc = e.pid ? readProcFields(e.pid) : null
+    // getOffset() works on a stopped tail (last consumed byte stands).
+    const offset = e.tail?.getOffset() ?? e.logBytes
+    e.logBytes = offset
+    writeMeta(e.taskDir, {
+      schema: 1,
+      id: e.id,
+      command: e.command,
+      description: e.description,
+      sessionID: e.sessionID,
+      pid: e.pid ?? 0,
+      pgid: e.pid ?? 0,
+      procStartTime: proc?.starttime ?? "",
+      startedAt: e.startedAt,
+      directory: e.directory,
+      pattern: e.patternSource,
+      wakeMode: e.wakeMode,
+      delivery: e.delivery,
+      coalesceMs: e.coalesceMs,
+      maxEvents: e.maxEvents,
+      idleTimeoutMs: e.idleTimeoutMs,
+      workspace: tasksWorkspace(),
+      lastOffset: offset,
+      linesScanned: e.linesScanned,
+      linesMatched: e.linesMatched,
+      eventsSent: e.eventsSent,
+      eventsDropped: e.eventsDropped,
+      state: "running",
+      exitInfo: null,
+      claimedBy: null,
+      updatedAt: Date.now(),
+    })
+    log(`${e.id}: parked for reattach (offset ${offset})`)
+  }
+  // Auto-reattach at creation: a restarted service picks up its
+  // workspace's surviving detached tasks without anyone calling a tool.
+  void reattachDetached().catch((err) =>
+    log(`reattach scan failed: ${String(err)}`),
+  )
+
+  return { start, stop, keepalive, update, list, reattachDetached, stopAll, dispose }
 }

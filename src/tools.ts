@@ -20,6 +20,7 @@ export function createTools(registry: Registry): ToolDefinition[] {
       "The command must be non-interactive (stdin is closed) and must not append '&' — backgrounding is managed for you.",
       "Output is rate-limited (burst 5, then 1/s; excess lines are dropped, counted in monitor_list). Wake lines arriving within a short window are merged into one notification by default (`coalesce_ms`, default 500ms) — high-frequency output costs one event per batch, not one per line.",
       "Stops automatically when the command exits or when max_events is reached; an idle_timeout_ms expiry asks the agent first (keepalive vs kill) instead of killing a silent command outright. The exit status is sent as a final notification.",
+      "LIFETIME MODES: `mode: \"attached\"` (default) ties the command to this service — if the service dies, the command dies with it. `mode: \"detached\"` (Linux only) makes the command SURVIVE the service: output is appended to a per-task log file, and a restarted service automatically reattaches (resumes watching from where it left off, sends one summary of lines missed while away, idle timer re-armed). Use detached for tasks expected to outlive the service (overnight training); use attached for ordinary background jobs. Detached tasks are stopped exactly the same way (monitor_stop).",
       "Returns immediately with a monitor id. Stop early with monitor_stop; inspect states with monitor_list.",
     ].join(" "),
     input: {
@@ -67,6 +68,12 @@ export function createTools(registry: Registry): ToolDefinition[] {
           type: "integer",
           description: `Merge wake lines arriving within this window into ONE notification (first 10 lines, 200 chars each; the batch counts as a single event). Default ${COALESCE_DEFAULT}ms — bursts of high-frequency output become one notification instead of one per line. 0 disables merging; max ${COALESCE_LIMIT}.`,
         },
+        mode: {
+          type: "string",
+          enum: ["attached", "detached"],
+          description:
+            'Lifetime mode. "attached" (default): the command dies with the OpenCode service (pipes + host-exit guards). "detached" (Linux only): the command survives the service death/restart — output goes to a per-task log file, the exit code is recorded by a wrapper, and the next service start reattaches automatically (missed lines summarized in ONE notification, not replayed; idle timer restarts from zero).',
+        },
       },
       required: ["command"],
       additionalProperties: false,
@@ -83,6 +90,7 @@ export function createTools(registry: Registry): ToolDefinition[] {
         wake_mode: i.wake_mode,
         delivery: i.delivery,
         coalesce_ms: i.coalesce_ms,
+        mode: i.mode,
         executeContext: context,
       })
       if (!result.ok) {

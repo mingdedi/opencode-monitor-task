@@ -14,6 +14,7 @@ export const COALESCE_LIMIT = 60_000
 
 export type WakeMode = "all" | "pattern"
 export type Delivery = "queue" | "steer"
+export type MonitorMode = "attached" | "detached"
 
 // Command substitution is rejected outright (qwen parity) to limit injection.
 const FORBIDDEN_PATTERNS: Array<{ re: RegExp; label: string }> = [
@@ -213,6 +214,38 @@ export function validateParams(input: {
   }
 
   return { maxEvents, idleTimeoutMs }
+}
+
+export interface ModeValidation {
+  monitorMode?: MonitorMode
+  error?: string
+}
+
+/**
+ * Lifetime mode (M9):
+ * - "attached" (default): today's behaviour — the monitor dies with the
+ *   service (process guards kill its group on host exit); output arrives
+ *   over pipes held by the service.
+ * - "detached": the command survives the service — output is appended to
+ *   a per-task log file (the file is the pipe), the exit code is recorded
+ *   by a wrapper, and a restarted service reattaches from the store.
+ *   Linux-only: it relies on setsid-style process groups, /proc stat
+ *   probing and POSIX signals.
+ */
+export function validateMode(
+  raw: unknown,
+  platform: string = process.platform,
+): ModeValidation {
+  if (raw === undefined || raw === null || raw === "") return { monitorMode: "attached" }
+  if (raw !== "attached" && raw !== "detached") {
+    return { error: `mode must be "attached" or "detached"; got ${String(raw)}` }
+  }
+  if (raw === "detached" && platform !== "linux") {
+    return {
+      error: `mode "detached" is Linux-only (POSIX process groups + /proc probing); current platform: ${platform}`,
+    }
+  }
+  return { monitorMode: raw }
 }
 
 export interface DirectoryValidation {

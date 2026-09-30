@@ -68,6 +68,7 @@ function monitor(over: Partial<PublicInfo> = {}): PublicInfo {
     command: "echo hi",
     description: "",
     state: "running",
+    mode: "attached",
     pid: 123,
     session_id: "ses_main",
     events_sent: 1,
@@ -85,6 +86,8 @@ function monitor(over: Partial<PublicInfo> = {}): PublicInfo {
     stopped_at: null,
     exit_info: null,
     idle_deadline: null,
+    reattached: false,
+    log_bytes: null,
     ...over,
   }
 }

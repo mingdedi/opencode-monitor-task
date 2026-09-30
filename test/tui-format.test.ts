@@ -18,6 +18,7 @@ function monitor(over: Partial<PublicInfo> = {}): PublicInfo {
     command: "python train.py",
     description: "",
     state: "running",
+    mode: "attached",
     pid: 4242,
     session_id: "ses_cur",
     events_sent: 11,
@@ -35,6 +36,8 @@ function monitor(over: Partial<PublicInfo> = {}): PublicInfo {
     stopped_at: null,
     exit_info: null,
     idle_deadline: null,
+    reattached: false,
+    log_bytes: null,
     ...over,
   }
 }
