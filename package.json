@@ -1,6 +1,6 @@
 {
   "name": "opencode-monitor-task",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode V2 plugin: Qwen Code-style monitor tool — run background commands whose stage output wakes the agent automatically.",
   "type": "module",
   "exports": {

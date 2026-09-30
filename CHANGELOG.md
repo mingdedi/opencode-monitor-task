@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-30
+
+### Added
+
+- **Detached mode** (`mode: "detached"`, Linux only, default `attached`): monitor
+  commands that survive OpenCode service death/restart. The command runs in its
+  own process group writing stdout+stderr to a per-task log file (no pipe to the
+  service — service death cannot SIGPIPE it; host-exit guards deliberately skip
+  it). Exit codes are recorded by an `EXIT`-trap wrapper. A restarted service
+  scans the task store at plugin load and reattaches its workspace's tasks:
+  counters resume from `meta.json`, missed lines arrive as ONE summary
+  notification (never replayed), the idle clock is frozen while unattended and
+  re-armed from zero on reattach. Pid reuse is defended via `/proc` `starttime`
+  matching, and zombie wrappers (non-reaping PID 1) are detected via the
+  `/proc` state letter; a task that died unattended is finalized from its exit file
+  (`exit unknown` when the group was SIGKILLed) and its owning session is
+  notified with the outcome; terminal records are swept after a 1h TTL (at
+  every service start and every 10 minutes while any detached task is live). `monitor_stop`/`monitor_keepalive`/`monitor_update` operate
+  on reattached monitors exactly as before; `monitor_list` now reports `mode`,
+  `reattached`, and `log_bytes` for detached tasks.
+- New modules `src/taskstore.ts` (atomic per-task meta/exit store + `/proc`
+  helpers + TTL sweeper) and `src/tail.ts` (polled file tail-follow reader
+  feeding the same line pipeline pipes use).
+
 ### Changed
 
 - `coalesce_ms` now defaults to 500 (previously 0/off): wake lines arriving
