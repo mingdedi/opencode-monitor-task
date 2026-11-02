@@ -1,13 +1,18 @@
 // Sidebar panel runtime: polls the state bridge file on an interval and
 // renders the line model into the sidebar.content slot. Follows the proven
-// patterns of the statusline plugin — a static jsx-runtime import (the host
-// resolves it inside the TUI process; ambient types cover typecheck),
-// storage.memory as the reactive store (survives hot reloads), and a probe
-// log for load diagnostics.
+// patterns of the statusline plugin — storage.memory as the reactive store
+// (survives hot reloads) and a probe log for load diagnostics.
+//
+// jsx-runtime: NO module-level import here. Verified on v2.2.5 (and already
+// suspected on v2.0.11): the host resolves bare @opentui/* / @opencode/*
+// specifiers only in the plugin ENTRY file it scanned — any file reached
+// through an import chain (shim re-export, dynamic import, you name it)
+// fails with "Cannot find package '@opentui/solid'". So the entry file
+// (root tui.ts / defineTuiPlugin host param) imports the runtime and hands
+// the jsx/jsxs pair down through PanelOptions.
 import { appendFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import * as jsxrt from "@opentui/solid/jsx-runtime"
 import { stateDir, workspaceRootOf } from "../state"
 import { renderLines, type Line } from "./format"
 import type { CurrentSession } from "./current-session"
@@ -23,9 +28,6 @@ const log = (s: string) => {
   }
 }
 
-const jsx = jsxrt.jsx
-const jsxs = jsxrt.jsxs ?? jsxrt.jsx
-
 export interface PanelHandle {
   el: () => unknown
   dispose: () => void
@@ -33,6 +35,13 @@ export interface PanelHandle {
 
 export interface PanelOptions {
   pollMs?: number
+  /**
+   * jsx-runtime pair from the host, imported by the plugin ENTRY file (the
+   * only place the host resolves @opentui/* specifiers — see the header
+   * note). Required: without it the panel cannot render.
+   */
+  jsx: (tag: string, props: Record<string, unknown>) => unknown
+  jsxs: (tag: string, props: Record<string, unknown>) => unknown
   /**
    * Source ① of the current-session chain: the session the TUI router is
    * focused on (see createCurrentSessionGetter). Three states — string /
@@ -44,9 +53,11 @@ export interface PanelOptions {
 
 export function createPanel(
   context: TuiContext,
-  opts: PanelOptions = {},
+  opts: PanelOptions,
 ): PanelHandle {
   const pollMs = opts.pollMs ?? 500
+  const jsx = opts.jsx
+  const jsxs = opts.jsxs
   const dir = stateDir()
   const workspace = workspaceRootOf(context.location)
   const muted = context.theme.text.muted

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **TUI sidebar panel stopped loading on OpenCode ≥ 2.1.4** ("Cannot find package
+  '@opentui/solid' imported from .../src/panel/view.ts" in
+  `/tmp/opencode-monitor-tui.log`). The host resolves bare `@opentui/*` /
+  `@opencode/*` specifiers only in the plugin entry file it scans; the panel's
+  top-level `@opentui/solid/jsx-runtime` import lived in a file reached through
+  the shim + dynamic-import chain, so it stopped resolving when the host's
+  injection behavior tightened. The jsx-runtime pair is now imported by the
+  entry file itself (root `tui.ts`, mirroring the single-file statusline
+  plugin) and handed down to the panel via the new `defineTuiPlugin(host)`
+  factory; `src/panel/view.ts` no longer imports any host package. Server
+  side is unaffected (it never evaluates `tui.ts`, verified on v2.2.5).
+
 ## [0.2.0] - 2026-09-30
 
 ### Added
